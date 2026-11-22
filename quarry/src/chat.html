@@ -104,6 +104,17 @@ svg { display: block; }
          color: var(--faint); border-bottom: 1px solid var(--line); }
 .cb .h button { border: 0; background: none; color: var(--dim); font-size: 12px; padding: 2px 6px; border-radius: 5px; }
 .cb .h button:hover { background: var(--raise); color: var(--text); }
+.cb .h .acts { display: flex; gap: 2px; }
+.cb .h button.on { background: var(--raise); color: var(--ore); }
+.cb .pv { display: none; background: #fff; border-top: 1px solid var(--line); }
+.cb.preview .pv { display: block; }
+.cb.preview pre { display: none; }
+.cb .pv iframe { display: block; width: 100%; height: 420px; border: 0; resize: vertical; overflow: auto; background: #fff; }
+#full { position: fixed; inset: 0; z-index: 40; background: rgba(10,9,8,.94); display: none; flex-direction: column;
+        padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); gap: 8px; }
+#full.on { display: flex; }
+#full .fbar { flex: none; min-height: 36px; display: flex; justify-content: space-between; align-items: center; color: #eee; font: 13px var(--mono); }
+#full iframe { flex: 1; min-height: 0; width: 100%; border: 0; border-radius: 10px; background: #fff; }
 .cb pre { margin: 0; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); }
 .cb pre code { background: none; border: 0; padding: 0; }
 details.think { margin: 0 0 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
@@ -222,6 +233,7 @@ details.think .tx { padding: 0 14px 10px; color: var(--dim); font-size: 13.5px; 
 </main>
 
 <div id="scrim"></div>
+<div id="full" role="dialog" aria-label="Preview"><div class="fbar"><span class="lbl">Preview</span><button class="iconbtn" id="fclose" aria-label="Close preview"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div></div>
 <div id="drawer" aria-label="Settings">
   <header>Settings <button class="iconbtn" id="dclose" aria-label="Close"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></header>
   <div class="in">
@@ -254,12 +266,59 @@ function inline(t) {
           .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<i>$2</i>")
           .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
+// code blocks that can be shown live: SVG drawings and HTML pages
+function previewKind(lang, code) {
+  const l = (lang || "").toLowerCase(), c = code.trimStart().slice(0, 400).toLowerCase();
+  if (l === "svg" || ((l === "xml" || !l) && c.includes("<svg"))) return "svg";
+  if (l === "html" || l === "htm" || ((!l || l === "xml") && (c.startsWith("<!doctype html") || c.startsWith("<html")))) return "html";
+  return "";
+}
+// Runs in a sandboxed frame (scripts allowed, but no access to this page, its storage or cookies)
+function previewDoc(kind, code) {
+  if (kind === "svg")
+    return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+           '<style>html,body{margin:0;height:100%;background:#fff}body{display:grid;place-items:center}svg{max-width:100%;max-height:100vh;height:auto}svg[viewBox]{width:100%;height:100%}</style>' + code;
+  return code;
+}
+function frame(kind, code) {
+  const f = document.createElement("iframe");
+  f.setAttribute("sandbox", "allow-scripts allow-modals allow-pointer-lock");
+  f.setAttribute("referrerpolicy", "no-referrer");
+  f.title = kind === "svg" ? "SVG preview" : "HTML preview";
+  f.srcdoc = previewDoc(kind, code);
+  return f;
+}
+function openFull(kind, code) {
+  const el = $("full");
+  el.querySelector(".lbl").textContent = kind === "svg" ? "SVG preview" : "HTML preview";
+  const old = el.querySelector("iframe"); if (old) old.remove();
+  el.appendChild(frame(kind, code));
+  el.classList.add("on");
+}
+function closeFull() { const el = $("full"); el.classList.remove("on"); const f = el.querySelector("iframe"); if (f) f.remove(); }
+function wirePreviews(root) {
+  root.querySelectorAll(".cb[data-kind]").forEach(cb => {
+    const kind = cb.dataset.kind, code = () => cb.querySelector("code").textContent, b = cb.querySelector("[data-pv]");
+    b.onclick = () => {
+      const on = !cb.classList.contains("preview");
+      cb.classList.toggle("preview", on);
+      b.classList.toggle("on", on); b.textContent = on ? "Code" : "Preview";
+      const pv = cb.querySelector(".pv");
+      pv.innerHTML = "";
+      if (on) pv.appendChild(frame(kind, code()));
+    };
+    cb.querySelector("[data-full]").onclick = () => openFull(kind, code());
+  });
+}
 function md(src) {
   const out = [], parts = src.split(/```/);
   parts.forEach((p, i) => {
     if (i % 2) {
       const nl = p.indexOf("\n"), lang = nl > 0 ? p.slice(0, nl).trim() : "", code = (nl >= 0 ? p.slice(nl + 1) : p).replace(/\n$/, "");
-      out.push('<div class="cb"><div class="h"><span>' + esc(lang || "code") + '</span><button data-copy>Copy</button></div><pre><code>' + esc(code) + "</code></pre></div>");
+      const kind = previewKind(lang, code);
+      out.push('<div class="cb"' + (kind ? ' data-kind="' + kind + '"' : "") + '><div class="h"><span>' + esc(lang || "code") + '</span><span class="acts">' +
+               (kind ? '<button data-pv>Preview</button><button data-full title="Open full screen">⤢</button>' : "") +
+               '<button data-copy>Copy</button></span></div><pre><code>' + esc(code) + '</code></pre><div class="pv"></div></div>');
       return;
     }
     const lines = esc(p).split("\n");
@@ -364,6 +423,8 @@ function fillAsst(d, m, live, isLast) {
     det.open = live ? !m.content || wasOpen : false;
     if (live && !m.content) tx.scrollTop = tx.scrollHeight;
   }
+  if (!live) wirePreviews(body);
+  else body.querySelectorAll("[data-pv],[data-full]").forEach(b => b.disabled = true);
   body.querySelectorAll("[data-copy]").forEach(b => b.onclick = () => copy(b.closest(".cb").querySelector("code").textContent, b));
   const ca = body.querySelector("[data-copyall]"); if (ca) ca.onclick = () => copy(m.content, ca);
   const rg = body.querySelector("[data-regen]"); if (rg) rg.onclick = regen;
@@ -546,7 +607,8 @@ function submit() {
   $("in").value = ""; $("in").style.height = ""; $("send").disabled = true;
   send(t);
 }
-document.addEventListener("keydown", e => { if (e.key === "Escape") { openDrawer(false); closeSide(); } });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeFull(); openDrawer(false); closeSide(); } });
+$("fclose").onclick = closeFull;
 
 if (location.hash === "#demo") {   // sample conversation for screenshots (not saved)
   save = () => {};
