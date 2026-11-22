@@ -37,6 +37,25 @@ Coding quality, greedy, HumanEval (every 8th task, 21 tasks, executed against th
 - expert cache hit rate ~93% when a layer starts, next-layer prediction accuracy ~82%
 - prompt processing: ~26 tok/s on a 1511-token prompt (batched, 512 tokens at a time)
 
+### Qwen3.8-35B-A3B-Distill (Q3_K_M, 17.7GB, `qwen35moe`)
+
+Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 experts.
+
+| | |
+|---|---|
+| generation, short context (default: 6 of 8 experts, 5GB cache) | ~6.6-6.8 tok/s |
+| generation, exact (`--experts 8`) | ~5.8 tok/s |
+| generation at 12.6K context | ~4.6 tok/s |
+| prompt processing | ~28 tok/s (5K tokens), ~21 tok/s (12.6K tokens) |
+| HumanEval subset (21 tasks), 6 experts / 8 experts | **20/21** (45s/task) / 20/21 (52s/task) |
+
+- logits match llama.cpp (cosine 0.998, same top token), token by token and batched
+- opencode end to end (write a file, run it): first turn 10 min (12.6K-token prompt),
+  later turns reuse the cached prefix (~3s of prompt processing)
+- thinking is off by default; `--think` or `"chat_template_kwargs": {"enable_thinking": true}`
+- the output layer (248K vocab) runs from a 4-bit copy that picks 64 candidates, whose exact
+  logits are computed from the file's rows (`QUARRY_EXACT_OUTPUT=1` keeps the full matrix in RAM)
+
 ### Inkling 2 Mini (Q4_K_M, 18.7GB, `inkling2_loop`)
 
 | engine | generation tok/s |
@@ -73,7 +92,7 @@ Options:
 
 - `QUARRY_CACHE_GB`: expert cache size. Use most of your free RAM minus the dense
   weights (~0.9GB for Qwen3-Coder) and the KV cache (fp16, ~100KB per token of context).
-- `--experts N`: experts per token for Qwen3-MoE (default 6; 8 is the exact model).
+- `--experts N`: experts per token for Qwen MoE models (default 6; 8 is the exact model).
 - `-c N`: context length (default 4096). Memory is only used as the context fills.
 - `--skip 0.1` (Inkling, lossy): skip an expert that isn't in RAM when it has under 10%
   of the routing weight.
@@ -118,6 +137,9 @@ laptop like this one. Later turns reuse the cached prefix and only process what'
   is repacked once to int8 and reused for every token with VNNI `dpbusd`, tokens are
   grouped by expert so each expert is read once per batch, and attention runs as small
   matrix multiplies over a transposed K.
+- `src/qwen35.c`: Qwen3.5/3.6 MoE forward pass (gated delta net with a 128x128 state per
+  head, gated attention, shared expert). The recurrent state can't be rewound, so it is
+  snapshotted at the end of each prompt for prefix reuse.
 - `src/inkling.c`: Inkling 2 forward pass (looped layers, block-residual mixing,
   relative-position attention with sinks, short convolutions, sigmoid-routed MoE).
 - `src/quants.c`: Q3_K, Q4_K, Q5_K, Q6_K, Q5_0 and Q8_0 kernels (AVX-512 VNNI),
@@ -132,10 +154,10 @@ and MBPP against a running server.
 
 ## Limits
 
-- architectures: qwen3moe, inkling2_loop
+- architectures: qwen3moe, qwen35moe (Qwen3.5/3.6 MoE text), inkling2_loop
 - x86-64 with AVX-512 VNNI only (Ice Lake or newer, Zen 4 or newer)
-- one sequence at a time; batched prompt processing is Qwen with Q3_K weights only
-  (other cases fall back to token by token)
+- one sequence at a time; batched prompt processing for Qwen3-Coder (Q3_K weights) and
+  Qwen3.5/3.6 (Q3_K-Q6_K); Inkling runs token by token
 - the tokenizer comes from libllama (vocab-only load)
 
 ## License

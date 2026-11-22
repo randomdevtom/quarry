@@ -104,7 +104,49 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
 
     m->tok_embd = mat(g, "token_embd.weight", 0, 1);
     m->output_norm = f32(g, "output_norm.weight");
-    m->output = mat(g, qg_find_tensor(g, "output.weight") ? "output.weight" : "token_embd.weight", 1, 1);
+    {
+        const char *on = qg_find_tensor(g, "output.weight") ? "output.weight" : "token_embd.weight";
+        // default: a 4-bit copy in RAM finds the top candidates, their exact logits come from the
+        // file's rows (read from the SSD). QUARRY_EXACT_OUTPUT=1 keeps the whole matrix in RAM.
+        const int exact = getenv("QUARRY_EXACT_OUTPUT") || c->n_embd % 256;
+        m->output = mat(g, on, exact, 1);
+        if (!exact) {
+            const qmat *O = &m->output;
+            const int nb = O->cols / 64;
+            m->out4_rb = nb * 36;
+            m->out4 = xalloc((size_t)O->rows * m->out4_rb);
+            enum { CH = 2048 };
+            uint8_t *raw = malloc((size_t)CH * O->row_bytes);
+            for (int r0 = 0; r0 < O->rows; r0 += CH) {
+                const int nr = O->rows - r0 < CH ? O->rows - r0 : CH;
+                read_at(g, raw, (uint64_t)nr * O->row_bytes, O->file_off + (uint64_t)r0 * O->row_bytes);
+                #pragma omp parallel
+                {
+                    float *f = malloc((size_t)O->cols * 4);
+                    #pragma omp for schedule(static)
+                    for (int r = 0; r < nr; r++) {
+                        dequant_row(O->type, raw + (size_t)r * O->row_bytes, f, O->cols);
+                        uint8_t *dst = m->out4 + (size_t)(r0 + r) * m->out4_rb;
+                        for (int b = 0; b < nb; b++) {
+                            const float *v = f + b * 64;
+                            float amax = 0;
+                            for (int i = 0; i < 64; i++) amax = fabsf(v[i]) > amax ? fabsf(v[i]) : amax;
+                            const float d = amax / 7.5f, id = d > 0 ? 1.0f / d : 0;
+                            memcpy(dst + b * 36, &d, 4);
+                            uint8_t *q = dst + b * 36 + 4;
+                            for (int i = 0; i < 32; i++) {
+                                int lo = (int)lrintf(v[i] * id - 0.5f) + 8, hi = (int)lrintf(v[i + 32] * id - 0.5f) + 8;
+                                lo = lo < 0 ? 0 : lo > 15 ? 15 : lo; hi = hi < 0 ? 0 : hi > 15 ? 15 : hi;
+                                q[i] = (uint8_t)(lo | hi << 4);
+                            }
+                        }
+                    }
+                    free(f);
+                }
+            }
+            free(raw);
+        }
+    }
     m->layers = calloc(c->n_layer, sizeof(q35_layer));
     m->attn_idx = malloc(c->n_layer * sizeof(int));
     m->rec_idx = malloc(c->n_layer * sizeof(int));
@@ -659,8 +701,54 @@ float *q35_forward(q35_model *m, int token, int pos) {
     double t0 = qnow();
     qin q;
     qin_init(&q, xn, D, s->qk, s->a_qs, s->a_d, s->a_s);
-    mv_job j = {&m->output, m->logits};
-    mv_multi(&j, 1, &q);
+    if (!m->out4) {
+        mv_job j = {&m->output, m->logits};
+        mv_multi(&j, 1, &q);
+    } else {
+        // approximate logits from the 4-bit copy: w = d * (q - 8 + 0.5), x as u8 (+128) per 256
+        static uint8_t xu[8192] __attribute__((aligned(64)));
+        static float dx[32];
+        quantize_row_u8(xn, xu, dx, D);
+        const qmat *O = &m->output;
+        const int nb = D / 64, rb = m->out4_rb;
+        // sum over each 64-block of (xu - 128), for the +0.5 offset
+        float xs[128];
+        for (int b = 0; b < nb; b++) { int sacc = 0; for (int i = 0; i < 64; i++) sacc += xu[b * 64 + i] - 128; xs[b] = sacc * 0.5f * dx[b / 4]; }
+        const __m512i c128 = _mm512_set1_epi8((char)128), m4 = _mm512_set1_epi8(15), c8 = _mm512_set1_epi8(8);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < O->rows; r++) {
+            const uint8_t *row = m->out4 + (size_t)r * rb;
+            __m512 acc = _mm512_setzero_ps();
+            float off = 0;
+            for (int b = 0; b < nb; b++) {
+                float d; memcpy(&d, row + b * 36, 4);
+                const __m256i p = _mm256_loadu_si256((const __m256i *)(row + b * 36 + 4));
+                const __m512i pp = _mm512_inserti64x4(_mm512_castsi256_si512(p), _mm256_srli_epi16(p, 4), 1);
+                const __m512i qv = _mm512_sub_epi8(_mm512_and_si512(pp, m4), c8);
+                const __m512i xv = _mm512_loadu_si512((const void *)(xu + b * 64));
+                __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, qv);
+                dp = _mm512_sub_epi32(dp, _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, qv));
+                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), _mm512_set1_ps(d * dx[b / 4]), acc);
+                off += d * xs[b];
+            }
+            m->logits[r] = _mm512_reduce_add_ps(acc) + off;
+        }
+        // exact logits for the top candidates, rows read from the file
+        enum { NC = 64 };
+        int cand[NC], nc = 0;
+        for (int r = 0; r < O->rows; r++) {
+            if (nc < NC || m->logits[r] > m->logits[cand[nc - 1]]) {
+                int j = nc < NC ? nc++ : NC - 1;
+                while (j > 0 && m->logits[cand[j - 1]] < m->logits[r]) { cand[j] = cand[j - 1]; j--; }
+                cand[j] = r;
+            }
+        }
+        static uint8_t *rows;
+        if (!rows) rows = malloc((size_t)NC * O->row_bytes);
+        for (int j = 0; j < nc; j++) read_at(&m->g, rows + (size_t)j * O->row_bytes, O->row_bytes, O->file_off + (uint64_t)cand[j] * O->row_bytes);
+        qin_need(&q, O->type);
+        for (int j = 0; j < nc; j++) m->logits[cand[j]] = row_dot(O->type, rows + (size_t)j * O->row_bytes, O->cols, &q);
+    }
     q35_prof[5] += qnow() - t0;
     return m->logits;
 }

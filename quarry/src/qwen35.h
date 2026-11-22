@@ -43,6 +43,8 @@ typedef struct q35_model {
     q35_cfg c;
     qg_file g;
     qmat tok_embd, output;
+    uint8_t *out4;                  // 4-bit copy of output for candidate search: per row, per 64 values: f32 scale + 32 bytes
+    int out4_rb;                    // its row bytes
     float *output_norm;
     q35_layer *layers;
     struct expert_store *experts;
