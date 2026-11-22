@@ -33,6 +33,7 @@ typedef struct {
     ink_model im;
     q35_model qm;
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
+    int (*reason_emit)(const char *, void *);   // if set: thinking text goes here (HTTP reasoning_content)
     int t_think_end, think, think_default;   // q35: "</think>" token; thinking on for this request / by default
     // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
     int t_think, t_text, t_end_msg, t_msg_model, mode, show_thinking;
@@ -180,7 +181,8 @@ static int emit_tok(engine *e, int tok, int g, char *buf, int cap, emit_fn emit,
         e->mode = 2;
     } else if (e->q35 && e->mode == 1) {
         piece(e, tok, buf, cap);
-        if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
+        if (e->reason_emit) stop = e->reason_emit(buf, ud);
+        else if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
     } else if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
         // Inkling structure tokens: switch between thinking and answer, print nothing
         const int was = e->mode;
@@ -839,21 +841,50 @@ static void send_all(int fd, const char *b, size_t n) {
     while (n) { ssize_t w = send(fd, b, n, MSG_NOSIGNAL); if (w <= 0) return; b += w; n -= w; }
 }
 
-typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent; int in_call; } req_ctx;
+typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent; int in_call;
+                 char pend[2][8]; int npend[2]; } req_ctx;   // pend: an incomplete UTF-8 character per field
 
-static int send_delta(req_ctx *r, const char *t, size_t n) {
+// length of the longest prefix of s[0..n) that does not end inside a UTF-8 character
+static size_t utf8_complete(const char *s, size_t n) {
+    size_t i = n, k = 0;
+    while (i > 0 && k < 4 && ((unsigned char)s[i - 1] & 0xC0) == 0x80) { i--; k++; }   // continuation bytes
+    if (i == 0) return n;
+    const unsigned char lead = (unsigned char)s[i - 1];
+    const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    return need > k + 1 ? i - 1 : n;
+}
+static int send_delta_field(req_ctx *r, const char *field, const char *t0, size_t n0) {
+    // token pieces can split a multi-byte character: send complete characters only
+    const int fi = field[0] == 'r';
+    char *t = malloc(n0 + 8);
+    memcpy(t, r->pend[fi], r->npend[fi]);
+    memcpy(t + r->npend[fi], t0, n0);
+    size_t n = n0 + r->npend[fi];
+    const size_t ok = utf8_complete(t, n);
+    r->npend[fi] = (int)(n - ok);
+    memcpy(r->pend[fi], t + ok, n - ok);
+    n = ok;
+    if (!n) { free(t); return 0; }
     char *tmp = strndup(t, n);
+    free(t);
     size_t cap = n * 6 + 16;
     char *esc = malloc(cap), *msg = malloc(cap + 256);
     json_escape(tmp, esc, cap);
     int len = sprintf(msg,
                       "data: {\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion.chunk\",\"model\":\"quarry\","
-                      "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-                      r->id, esc);
+                      "\"choices\":[{\"index\":0,\"delta\":{\"%s\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                      r->id, field, esc);
     int bad = send(r->fd, msg, len, MSG_NOSIGNAL) <= 0;
     free(tmp); free(esc); free(msg);
     if (bad) r->broken = 1;
     return bad;
+}
+
+static int send_delta(req_ctx *r, const char *t, size_t n) { return send_delta_field(r, "content", t, n); }
+// thinking text, streamed as reasoning_content (keeps bytes flowing through proxies too)
+static int emit_reason_http(const char *t, void *ud) {
+    req_ctx *r = ud;
+    return r->stream ? send_delta_field(r, "reasoning_content", t, strlen(t)) : 0;
 }
 
 static int emit_http(const char *t, void *ud) {
@@ -970,7 +1001,9 @@ static void handle(engine *e, int fd) {
             send_all(fd, hdr, n);
         }
         gen_stats st = {0};
+        e->reason_emit = emit_reason_http;
         eng_generate(e, prompt, max_tokens, temp, top_p, emit_http, &rc, &st);
+        e->reason_emit = NULL;
         fprintf(stderr, "[req: %d msgs, %d prompt tok (%.1fs), %d gen tok, %.2f tok/s]\n", nm, st.prompt_tokens,
                 st.t_prompt, st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
         const char *finish = st.gen_tokens >= max_tokens ? "length" : "stop";
