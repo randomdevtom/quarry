@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 enum qg_type_id {
-    GT_F32 = 0, GT_F16 = 1, GT_Q4_0 = 2, GT_Q8_0 = 8,
+    GT_F32 = 0, GT_F16 = 1, GT_Q4_0 = 2, GT_Q5_0 = 6, GT_Q8_0 = 8,
     GT_Q2_K = 10, GT_Q3_K = 11, GT_Q4_K = 12, GT_Q5_K = 13, GT_Q6_K = 14,
 };
 
@@ -55,6 +55,8 @@ int64_t qg_get_int(const qg_file *g, const char *key, int64_t def);
 double qg_get_float(const qg_file *g, const char *key, double def);
 const char *qg_get_str(const qg_file *g, const char *key);
 const qg_tensor *qg_find_tensor(const qg_file *g, const char *name);
+// element i of a numeric array value
+int64_t qg_arr_int(const qg_kv *kv, uint64_t i);
 
 // bytes per block / elements per block for a ggml type
 size_t qg_type_block_bytes(int type);

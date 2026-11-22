@@ -6,3 +6,9 @@ research/route_trace.txt
 quarry/tests/*.f32
 quarry/tests/*.logits
 quarry/tests/*.ids
+vendor/
+research/data/
+research/results/
+research/__pycache__/
+research/trace_vendor
+__pycache__/

@@ -17,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "inkling.h"
 #include "model.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -24,7 +25,12 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 // ---------------- engine state (single sequence, prefix-reusing) ----------------
 
 typedef struct {
+    int ink;                           // 1: Inkling 2, 0: Qwen3-MoE
     qmodel m;
+    ink_model im;
+    // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
+    int t_think, t_text, t_end_msg, t_msg_model, mode, show_thinking;
+    float effort;
     struct llama_model *tok_model;     // vocab-only libllama model: tokenizer
     const struct llama_vocab *vocab;
     int *ctx_tokens, n_ctx_tokens;     // tokens whose KV is in the cache
@@ -44,7 +50,16 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     e->tok_model = llama_model_load_from_file(path, mp);
     if (!e->tok_model) return -1;
     e->vocab = llama_model_get_vocab(e->tok_model);
-    if (model_load(&e->m, path, n_ctx)) return -1;
+    e->ink = ink_detect(path);
+    if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
+    if (e->ink) {
+        int t[8];
+        const char *names[4] = {"<|content_thinking|>", "<|content_text|>", "<|end_message|>", "<|message_model|>"};
+        int *dst[4] = {&e->t_think, &e->t_text, &e->t_end_msg, &e->t_msg_model};
+        for (int i = 0; i < 4; i++)
+            *dst[i] = llama_tokenize(e->vocab, names[i], strlen(names[i]), t, 8, false, true) == 1 ? t[0] : -1;
+    }
+    e->effort = 0.2f;
     e->ctx_tokens = malloc(sizeof(int) * n_ctx);
     e->rng = (unsigned long long)time(NULL) * 2654435761ULL;
     return 0;
@@ -64,13 +79,23 @@ static int piece(engine *e, int tok, char *buf, int cap) {
 
 static int is_eog(engine *e, int tok) { return llama_vocab_is_eog(e->vocab, tok); }
 
+static int n_vocab(engine *e) { return e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
+static uint64_t bytes_read(engine *e) { return e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
+static float *fwd(engine *e, int tok, int pos) { return e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos); }
+static float *prefill(engine *e, const int *toks, int n, int pos0) {
+    if (!e->ink) return model_prefill(&e->m, toks, n, pos0);
+    float *lg = NULL;
+    for (int i = 0; i < n; i++) lg = ink_forward(&e->im, toks[i], pos0 + i);
+    return lg;
+}
+
 static float frand(engine *e) {
     e->rng ^= e->rng << 13; e->rng ^= e->rng >> 7; e->rng ^= e->rng << 17;
     return (e->rng >> 11) * (1.0 / 9007199254740992.0);
 }
 
 static int sample(engine *e, float *lg, float temp, float top_p) {
-    int nv = e->m.c.n_vocab;
+    int nv = n_vocab(e);
     int best = 0;
     for (int i = 1; i < nv; i++) if (lg[i] > lg[best]) best = i;
     if (temp <= 0) return best;
@@ -101,11 +126,8 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
     int common = 0;
     while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
     if (common == n) common = n - 1;   // need logits for the last token
-    float *lg = NULL;
-    for (int i = common; i < n; i++) {
-        lg = model_forward(&e->m, toks[i], i);
-        e->ctx_tokens[i] = toks[i];
-    }
+    float *lg = prefill(e, toks + common, n - common, common);
+    for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
     e->n_ctx_tokens = n;
     return lg;
 }
@@ -128,13 +150,25 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     t0 = now();
     char buf[256];
     int pos = n, g = 0;
+    e->mode = e->ink ? 0 : 2;
     for (; g < max_tokens; g++) {
         int tok = sample(e, lg, temp, top_p);
         if (is_eog(e, tok)) break;
-        piece(e, tok, buf, sizeof buf);
-        if (emit(buf, ud)) { g++; break; }
+        int stop = 0;
+        if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
+            // Inkling structure tokens: switch between thinking and answer, print nothing
+            const int was = e->mode;
+            e->mode = tok == e->t_think ? 1 : tok == e->t_text ? 2 : 0;
+            if (e->show_thinking && was == 1 && e->mode != 1) stop = emit("\033[0m\n", ud);
+            if (e->show_thinking && e->mode == 1) stop = emit("\033[2m", ud);
+        } else {
+            piece(e, tok, buf, sizeof buf);
+            if (e->mode == 2) stop = emit(buf, ud);
+            else if (e->mode == 1 && e->show_thinking) { e->mode = 1; stop = emit(buf, ud); }
+        }
+        if (stop) { g++; break; }
         e->ctx_tokens[pos] = tok;
-        lg = model_forward(&e->m, tok, pos++);
+        lg = fwd(e, tok, pos++);
         e->n_ctx_tokens = pos;
     }
     st->gen_tokens = g;
@@ -142,11 +176,27 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     free(toks);
 }
 
-// ChatML prompt (Qwen); messages: role/content pairs
+// chat prompt from role/content pairs: ChatML for Qwen, Inkling's own format otherwise
+static engine *g_eng;
 static char *chatml(const char **roles, const char **contents, int n) {
-    size_t len = 64;
-    for (int i = 0; i < n; i++) len += strlen(roles[i]) + strlen(contents[i]) + 32;
+    size_t len = 256;
+    for (int i = 0; i < n; i++) len += strlen(roles[i]) + strlen(contents[i]) + 96;
     char *p = malloc(len), *w = p;
+    if (g_eng && g_eng->ink) {
+        // the thinking-effort line goes before the first non-system message
+        int effort_done = 0;
+        for (int i = 0; i < n; i++) {
+            const int sys = !strcmp(roles[i], "system"), asst = !strcmp(roles[i], "assistant");
+            if (!effort_done && !sys) {
+                w += sprintf(w, "<|message_system|><|content_text|>Thinking effort level: %g<|end_message|>", g_eng->effort);
+                effort_done = 1;
+            }
+            const char *tag = sys ? "<|message_system|>" : asst ? "<|message_model|>" : !strcmp(roles[i], "tool") ? "<|message_tool|>" : "<|message_user|>";
+            w += sprintf(w, "%s<|content_text|>%s<|end_message|>%s", tag, contents[i], asst ? "<|content_model_end_sampling|>" : "");
+        }
+        if (!effort_done) sprintf(w, "<|message_system|><|content_text|>Thinking effort level: %g<|end_message|>", g_eng->effort);
+        return p;
+    }
     for (int i = 0; i < n; i++) w += sprintf(w, "<|im_start|>%s\n%s<|im_end|>\n", roles[i], contents[i]);
     sprintf(w, "<|im_start|>assistant\n");
     return p;
@@ -160,7 +210,8 @@ typedef struct { char *buf; size_t len; } acc_t;
 static int emit_cli(const char *t, void *ud) {
     acc_t *a = ud;
     size_t l = strlen(t);
-    if (a->len + l < (1 << 20) - 1) { memcpy(a->buf + a->len, t, l); a->len += l; }
+    // keep only the answer for the conversation history, not the thinking
+    if ((!g_eng || g_eng->mode == 2) && a->len + l < (1 << 20) - 1) { memcpy(a->buf + a->len, t, l); a->len += l; }
     fputs(t, stdout);
     fflush(stdout);
     return 0;
@@ -186,9 +237,24 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         char *reply = calloc(1, 1 << 20);
         gen_stats st = {0};
         acc_t acc = {reply, 0};
+        e->show_thinking = 1;
         eng_generate(e, p, n, temp, 0.9f, emit_cli, &acc, &st);
+        e->show_thinking = 0;
         fprintf(stderr, "\n[%d prompt tokens %.1fs | %d tokens %.2f tok/s]\n", st.prompt_tokens, st.t_prompt,
                 st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
+        if (getenv("QUARRY_STATS")) {
+            struct expert_store *es = e->ink ? e->im.experts : e->m.experts;
+            uint64_t h, mi, pi, pu;
+            experts_stats(es, &h, &mi, &pi, &pu);
+            fprintf(stderr, "[experts: hit %.1f%%, prefetch %llu issued / %llu used, io wait %.1fs, SSD %.2f GB",
+                    100.0 * h / (h + mi + 1e-9), (unsigned long long)pi, (unsigned long long)pu, experts_wait_seconds(es), bytes_read(e) / 1e9);
+            if (e->ink) fprintf(stderr, " | prediction %.0f%% (layer-start guess %.0f%%) | attn %.1fs moe %.1fs output %.1fs mix %.1fs",
+                                100.0 * e->im.pred_correct / (e->im.pred_total + 1e-9),
+                                100.0 * e->im.pred2_correct / (e->im.pred_total + 1e-9), ink_prof[0], ink_prof[1], ink_prof[2], ink_prof[3]);
+            if (e->ink && e->im.skipped) fprintf(stderr, " | skipped %llu experts", (unsigned long long)e->im.skipped);
+            if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);
+            fprintf(stderr, "]\n");
+        }
         roles[nm] = "assistant"; contents[nm++] = reply;
         free(p);
         if (!interactive) break;
@@ -314,30 +380,312 @@ static void json_escape(const char *s, char *o, size_t cap) {
     o[n] = 0;
 }
 
+// ---------------- tool calling (Qwen3-Coder format) ----------------
+
+typedef struct { char *p; size_t n, cap; } sbuf;
+static void sb_putn(sbuf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2; b->p = realloc(b->p, b->cap); }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+static void sb_put(sbuf *b, const char *s) { sb_putn(b, s, strlen(s)); }
+
+// raw JSON text of the value at v (malloc'd)
+static char *json_raw(const char *v) {
+    v = skip_ws(v);
+    const char *e = json_skip(v);
+    while (e > v && (e[-1] == ' ' || e[-1] == '\n' || e[-1] == '\r' || e[-1] == '\t')) e--;
+    char *o = malloc(e - v + 1);
+    memcpy(o, v, e - v);
+    o[e - v] = 0;
+    return o;
+}
+// iterate an object: *s at '{' first time, then whatever this returns; NULL at the end
+static const char *json_obj_next(const char *s, char **key, const char **val) {
+    s = skip_ws(s);
+    if (*s == '{' || *s == ',') s = skip_ws(s + 1);
+    if (*s != '"') return NULL;
+    const char *e;
+    *key = json_str(s, &e);
+    s = skip_ws(e);
+    if (*s == ':') s = skip_ws(s + 1);
+    *val = s;
+    return skip_ws(json_skip(s));
+}
+// iterate an array: *s at '[' first time; returns pointer to the element or NULL; *next set
+static const char *json_arr_next(const char *s, const char **next) {
+    s = skip_ws(s);
+    if (*s == '[' || *s == ',') s = skip_ws(s + 1);
+    if (*s == ']' || !*s) return NULL;
+    *next = skip_ws(json_skip(s));
+    return s;
+}
+static char *json_str_or_raw(const char *v) {   // Jinja's `x | string`, close enough
+    v = skip_ws(v);
+    return *v == '"' ? json_str(v, NULL) : json_raw(v);
+}
+static void put_trimmed(sbuf *b, const char *s) {
+    while (*s == ' ' || *s == '\n' || *s == '\t' || *s == '\r') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\n' || s[n - 1] == '\t' || s[n - 1] == '\r')) n--;
+    sb_putn(b, s, n);
+}
+// render_item_list() of the template: "\n<tag>[`a`, `b`]</tag>"
+static void put_item_list(sbuf *b, const char *arr, const char *tag) {
+    if (!arr || *skip_ws(arr) != '[') return;
+    const char *nx, *it = json_arr_next(arr, &nx);
+    if (!it) return;
+    sb_put(b, "\n<"); sb_put(b, tag); sb_put(b, ">[");
+    for (int i = 0; it; i++, it = json_arr_next(nx, &nx)) {
+        if (i) sb_put(b, ", ");
+        if (*it == '"') { char *x = json_str(it, NULL); sb_put(b, "`"); sb_put(b, x); sb_put(b, "`"); free(x); }
+        else { char *x = json_raw(it); sb_put(b, x); free(x); }
+    }
+    sb_put(b, "]</"); sb_put(b, tag); sb_put(b, ">");
+}
+static void put_tools(sbuf *b, const char *tools) {
+    sb_put(b, "\n\nYou have access to the following functions:\n\n<tools>");
+    const char *nx, *t = json_arr_next(tools, &nx);
+    for (; t; t = json_arr_next(nx, &nx)) {
+        const char *f = json_get(t, "function");
+        if (!f) f = t;
+        const char *v;
+        char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+        char *desc = (v = json_get(f, "description")) ? json_str_or_raw(v) : strdup("");
+        sb_put(b, "\n<function>\n<name>"); sb_put(b, name); sb_put(b, "</name>");
+        sb_put(b, "\n<description>"); put_trimmed(b, desc); sb_put(b, "</description>");
+        sb_put(b, "\n<parameters>");
+        const char *params = json_get(f, "parameters"), *props = params ? json_get(params, "properties") : NULL;
+        if (props && *skip_ws(props) == '{') {
+            char *k; const char *pv, *it = props;
+            while ((it = json_obj_next(it, &k, &pv))) {
+                sb_put(b, "\n<parameter>\n<name>"); sb_put(b, k); sb_put(b, "</name>");
+                const char *x;
+                if ((x = json_get(pv, "type"))) { char *ty = json_str_or_raw(x); sb_put(b, "\n<type>"); sb_put(b, ty); sb_put(b, "</type>"); free(ty); }
+                if ((x = json_get(pv, "description"))) { char *d = json_str_or_raw(x); sb_put(b, "\n<description>"); put_trimmed(b, d); sb_put(b, "</description>"); free(d); }
+                put_item_list(b, json_get(pv, "enum"), "enum");
+                if (*skip_ws(pv) == '{') {   // other keys, as <key>value</key>
+                    char *k2; const char *v2, *it2 = skip_ws(pv);
+                    while ((it2 = json_obj_next(it2, &k2, &v2))) {
+                        if (strcmp(k2, "type") && strcmp(k2, "description") && strcmp(k2, "enum") && strcmp(k2, "required")) {
+                            char *val = *skip_ws(v2) == '{' ? json_raw(v2) : json_str_or_raw(v2);
+                            sb_put(b, "\n<"); sb_put(b, k2); sb_put(b, ">"); sb_put(b, val); sb_put(b, "</"); sb_put(b, k2); sb_put(b, ">");
+                            free(val);
+                        }
+                        free(k2);
+                    }
+                }
+                put_item_list(b, json_get(pv, "required"), "required");
+                sb_put(b, "\n</parameter>");
+                free(k);
+            }
+        }
+        if (params) put_item_list(b, json_get(params, "required"), "required");
+        sb_put(b, "\n</parameters>\n</function>");
+        free(name); free(desc);
+    }
+    sb_put(b, "\n</tools>");
+    sb_put(b, "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+}
+
+// the Qwen3-Coder chat template (tools, assistant tool calls, tool results), as in the GGUF
+static char *chat_qwen(const char **roles, const char **contents, const char **tcalls, int n, const char *tools) {
+    sbuf b = {0};
+    int has_tools = tools && *skip_ws(tools) == '[' && *skip_ws(skip_ws(tools) + 1) != ']';
+    int i0 = 0;
+    if (n > 0 && !strcmp(roles[0], "system")) {
+        sb_put(&b, "<|im_start|>system\n"); sb_put(&b, contents[0]);
+        i0 = 1;
+    } else if (has_tools) sb_put(&b, "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.");
+    if (has_tools) put_tools(&b, tools);
+    if (i0 || has_tools) sb_put(&b, "<|im_end|>\n");
+    for (int i = i0; i < n; i++) {
+        const char *r = roles[i];
+        if (!strcmp(r, "assistant") && tcalls[i] && *skip_ws(tcalls[i]) == '[') {
+            sb_put(&b, "<|im_start|>assistant");
+            const char *c = contents[i];
+            while (*c == ' ' || *c == '\n') c++;
+            if (*c) { sb_put(&b, "\n"); put_trimmed(&b, contents[i]); sb_put(&b, "\n"); }
+            const char *nx, *tc = json_arr_next(tcalls[i], &nx);
+            for (; tc; tc = json_arr_next(nx, &nx)) {
+                const char *f = json_get(tc, "function");
+                if (!f) f = tc;
+                const char *v;
+                char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+                sb_put(&b, "\n<tool_call>\n<function="); sb_put(&b, name); sb_put(&b, ">\n");
+                if ((v = json_get(f, "arguments"))) {
+                    // OpenAI sends arguments as a JSON-encoded string; accept an object too
+                    char *args = *skip_ws(v) == '"' ? json_str(skip_ws(v), NULL) : json_raw(v);
+                    if (*skip_ws(args) == '{') {
+                        char *k; const char *av, *it = skip_ws(args);
+                        while ((it = json_obj_next(it, &k, &av))) {
+                            char *val = json_str_or_raw(av);
+                            sb_put(&b, "<parameter="); sb_put(&b, k); sb_put(&b, ">\n"); sb_put(&b, val); sb_put(&b, "\n</parameter>\n");
+                            free(val); free(k);
+                        }
+                    }
+                    free(args);
+                }
+                sb_put(&b, "</function>\n</tool_call>");
+                free(name);
+            }
+            sb_put(&b, "<|im_end|>\n");
+        } else if (!strcmp(r, "tool")) {
+            if (i == i0 || strcmp(roles[i - 1], "tool")) sb_put(&b, "<|im_start|>user\n");
+            sb_put(&b, "<tool_response>\n"); sb_put(&b, contents[i]); sb_put(&b, "\n</tool_response>\n");
+            if (i == n - 1 || strcmp(roles[i + 1], "tool")) sb_put(&b, "<|im_end|>\n");
+        } else {
+            sb_put(&b, "<|im_start|>"); sb_put(&b, r); sb_put(&b, "\n"); sb_put(&b, contents[i]); sb_put(&b, "<|im_end|>\n");
+        }
+    }
+    sb_put(&b, "<|im_start|>assistant\n");
+    return b.p;
+}
+
+// schema type of parameter `param` of function `fn` in the tools array ("" if unknown)
+static char *tool_param_type(const char *tools, const char *fn, const char *param) {
+    if (!tools || *skip_ws(tools) != '[') return strdup("");
+    const char *nx, *t = json_arr_next(tools, &nx);
+    for (; t; t = json_arr_next(nx, &nx)) {
+        const char *f = json_get(t, "function"), *v;
+        if (!f) f = t;
+        char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+        int match = !strcmp(name, fn);
+        free(name);
+        if (!match) continue;
+        const char *params = json_get(f, "parameters"), *props = params ? json_get(params, "properties") : NULL;
+        const char *pv = props ? json_get(props, param) : NULL, *ty = pv ? json_get(pv, "type") : NULL;
+        return ty && *skip_ws(ty) == '"' ? json_str(skip_ws(ty), NULL) : strdup("");
+    }
+    return strdup("");
+}
+
+// one parameter value as JSON: typed values stay raw when they parse, everything else is a string
+static void put_arg_value(sbuf *b, const char *val, const char *type) {
+    const char *s = val;
+    while (*s == ' ' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\n')) n--;
+    char *t = strndup(s, n);
+    int raw = 0;
+    if (!strcmp(type, "integer") || !strcmp(type, "number")) { char *e; strtod(t, &e); raw = n && !*e; }
+    else if (!strcmp(type, "boolean")) raw = !strcmp(t, "true") || !strcmp(t, "false");
+    else if (!strcmp(type, "object") || !strcmp(type, "array")) raw = n && (t[0] == '{' || t[0] == '[') && !*skip_ws(json_skip(t));
+    else if (!strcmp(type, "null")) raw = !strcmp(t, "null");
+    if (raw) sb_put(b, t);
+    else {
+        size_t cap = strlen(val) * 6 + 16;
+        char *esc = malloc(cap);
+        json_escape(val, esc, cap);
+        sb_put(b, "\""); sb_put(b, esc); sb_put(b, "\"");
+        free(esc);
+    }
+    free(t);
+}
+
+// split generated text into content (before the first <tool_call>) and an OpenAI tool_calls
+// JSON array (NULL when there are no calls)
+static char *parse_tool_calls(const char *text, const char *tools, long id, size_t *content_len) {
+    const char *first = strstr(text, "<tool_call>");
+    *content_len = first ? (size_t)(first - text) : strlen(text);
+    if (!first) return NULL;
+    sbuf out = {0};
+    sb_put(&out, "[");
+    int k = 0;
+    for (const char *p = first; (p = strstr(p, "<tool_call>")); k++) {
+        const char *end = strstr(p, "</tool_call>");
+        const char *fn = strstr(p, "<function=");
+        if (!fn || (end && fn > end)) break;
+        fn += 10;
+        const char *fe = strchr(fn, '>');
+        if (!fe) break;
+        char *name = strndup(fn, fe - fn);
+        const char *body_end = end ? end : p + strlen(p);
+        sbuf args = {0};
+        sb_put(&args, "{");
+        int na = 0;
+        for (const char *q = fe + 1; (q = strstr(q, "<parameter=")) && q < body_end;) {
+            q += 11;
+            const char *qe = strchr(q, '>');
+            if (!qe) break;
+            char *pname = strndup(q, qe - q);
+            const char *vs = qe + 1, *ve = strstr(vs, "</parameter>");
+            if (!ve || ve > body_end) ve = body_end;
+            if (*vs == '\n') vs++;
+            size_t vl = ve - vs;
+            if (vl && vs[vl - 1] == '\n') vl--;
+            char *val = strndup(vs, vl);
+            char *ty = tool_param_type(tools, name, pname);
+            size_t cap = strlen(pname) * 6 + 16;
+            char *pesc = malloc(cap);
+            json_escape(pname, pesc, cap);
+            if (na++) sb_put(&args, ",");
+            sb_put(&args, "\""); sb_put(&args, pesc); sb_put(&args, "\":");
+            put_arg_value(&args, val, ty);
+            free(pesc); free(ty); free(val); free(pname);
+            q = ve;
+        }
+        sb_put(&args, "}");
+        size_t cap = args.n * 2 + 16;
+        char *aesc = malloc(cap), nesc[512], head[1024];
+        json_escape(args.p, aesc, cap);
+        json_escape(name, nesc, sizeof nesc);
+        snprintf(head, sizeof head, "%s{\"index\":%d,\"id\":\"call_%ld_%d\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"",
+                 k ? "," : "", k, id, k, nesc);
+        sb_put(&out, head); sb_put(&out, aesc); sb_put(&out, "\"}}");
+        free(aesc); free(args.p); free(name);
+        if (!end) break;
+        p = end + 12;
+    }
+    sb_put(&out, "]");
+    if (k == 0) { free(out.p); return NULL; }
+    return out.p;
+}
+
 static void send_all(int fd, const char *b, size_t n) {
     while (n) { ssize_t w = send(fd, b, n, MSG_NOSIGNAL); if (w <= 0) return; b += w; n -= w; }
 }
 
-typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; } req_ctx;
+typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent; int in_call; } req_ctx;
+
+static int send_delta(req_ctx *r, const char *t, size_t n) {
+    char *tmp = strndup(t, n);
+    size_t cap = n * 6 + 16;
+    char *esc = malloc(cap), *msg = malloc(cap + 256);
+    json_escape(tmp, esc, cap);
+    int len = sprintf(msg,
+                      "data: {\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion.chunk\",\"model\":\"quarry\","
+                      "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                      r->id, esc);
+    int bad = send(r->fd, msg, len, MSG_NOSIGNAL) <= 0;
+    free(tmp); free(esc); free(msg);
+    if (bad) r->broken = 1;
+    return bad;
+}
 
 static int emit_http(const char *t, void *ud) {
     req_ctx *r = ud;
-    if (r->stream) {
-        char esc[2048], msg[2400];
-        json_escape(t, esc, sizeof esc);
-        int n = snprintf(msg, sizeof msg,
-                         "data: {\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion.chunk\",\"model\":\"quarry\","
-                         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
-                         r->id, esc);
-        if (send(r->fd, msg, n, MSG_NOSIGNAL) <= 0) { r->broken = 1; return 1; }
-    } else {
-        size_t l = strlen(t);
-        if (r->acc_len + l + 1 > r->acc_cap) r->acc = realloc(r->acc, r->acc_cap = (r->acc_cap + l) * 2);
-        memcpy(r->acc + r->acc_len, t, l);
-        r->acc_len += l;
-        r->acc[r->acc_len] = 0;
+    size_t l = strlen(t);
+    if (r->acc_len + l + 1 > r->acc_cap) r->acc = realloc(r->acc, r->acc_cap = (r->acc_cap + l) * 2);
+    memcpy(r->acc + r->acc_len, t, l);
+    r->acc_len += l;
+    r->acc[r->acc_len] = 0;
+    if (!r->stream || r->in_call) return 0;
+    if (!r->tools) { size_t n = r->acc_len - r->sent; r->sent = r->acc_len; return send_delta(r, r->acc + r->acc_len - n, n); }
+    // tools on: never stream the <tool_call> markup; hold back a possible start of it
+    const char *tc = strstr(r->acc + r->sent, "<tool_call>");
+    size_t upto = tc ? (size_t)(tc - r->acc) : r->acc_len;
+    if (tc) r->in_call = 1;
+    else {
+        static const char tag[] = "<tool_call>";
+        for (size_t k = sizeof tag - 2; k > 0; k--)
+            if (r->acc_len - r->sent >= k && !strncmp(r->acc + r->acc_len - k, tag, k)) { upto = r->acc_len - k; break; }
     }
-    return 0;
+    if (upto <= r->sent) return 0;
+    int bad = send_delta(r, r->acc + r->sent, upto - r->sent);
+    r->sent = upto;
+    return bad;
 }
 
 static void handle(engine *e, int fd) {
@@ -384,7 +732,7 @@ static void handle(engine *e, int fd) {
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
         send_all(fd, hdr, n);
     } else if (!strcmp(path, "/v1/chat/completions") && body) {
-        const char *roles[256], *contents[256];
+        const char *roles[256], *contents[256], *tcalls[256];
         int nm = 0;
         const char *msgs = json_get(body, "messages");
         if (msgs && *(msgs = skip_ws(msgs)) == '[') {
@@ -395,6 +743,7 @@ static void handle(engine *e, int fd) {
                 const char *r = json_get(v, "role"), *c = json_get(v, "content");
                 roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
                 contents[nm] = c ? content_text(c) : strdup("");
+                tcalls[nm] = json_get(v, "tool_calls");
                 nm++;
                 v = skip_ws(json_skip(v));
                 if (*v == ',') v++; else break;
@@ -406,8 +755,10 @@ static void handle(engine *e, int fd) {
         float temp = (v = json_get(body, "temperature")) ? atof(v) : 0.7f;
         float top_p = (v = json_get(body, "top_p")) ? atof(v) : 0.9f;
         int stream = (v = json_get(body, "stream")) && !strncmp(skip_ws(v), "true", 4);
-        char *prompt = chatml(roles, contents, nm);
-        req_ctx rc = {fd, stream, calloc(1, 1), 0, 1, 0, (long)time(NULL)};
+        const char *tools = json_get(body, "tools");
+        if (tools && *skip_ws(tools) != '[') tools = NULL;
+        char *prompt = e->ink ? chatml(roles, contents, nm) : chat_qwen(roles, contents, tcalls, nm, tools);
+        req_ctx rc = {fd, stream, calloc(1, 1), 0, 1, 0, (long)time(NULL), tools != NULL && !e->ink, 0, 0};
         if (stream) {
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%s\r\n", cors);
             send_all(fd, hdr, n);
@@ -417,28 +768,48 @@ static void handle(engine *e, int fd) {
         fprintf(stderr, "[req: %d msgs, %d prompt tok (%.1fs), %d gen tok, %.2f tok/s]\n", nm, st.prompt_tokens,
                 st.t_prompt, st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
         const char *finish = st.gen_tokens >= max_tokens ? "length" : "stop";
+        size_t content_len = rc.acc_len;
+        char *calls = rc.tools ? parse_tool_calls(rc.acc, tools, rc.id, &content_len) : NULL;
+        if (calls) finish = "tool_calls";
         if (stream) {
+            // text held back while it could have been the start of a tool call
+            if (!calls && rc.sent < rc.acc_len) send_delta(&rc, rc.acc + rc.sent, rc.acc_len - rc.sent);
+            else if (calls && rc.sent < content_len) send_delta(&rc, rc.acc + rc.sent, content_len - rc.sent);
+            if (calls) {
+                size_t cl = strlen(calls) + 512;
+                char *m = malloc(cl);
+                int n = snprintf(m, cl,
+                                 "data: {\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion.chunk\",\"model\":\"quarry\","
+                                 "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":%s},\"finish_reason\":null}]}\n\n",
+                                 rc.id, calls);
+                send_all(fd, m, n);
+                free(m);
+            }
             char end[512];
             int n = snprintf(end, sizeof end,
                              "data: {\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion.chunk\",\"model\":\"quarry\","
-                             "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\ndata: [DONE]\n\n",
-                             rc.id, finish);
+                             "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}],"
+                             "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\ndata: [DONE]\n\n",
+                             rc.id, finish, st.prompt_tokens, st.gen_tokens, st.prompt_tokens + st.gen_tokens);
             send_all(fd, end, n);
         } else {
-            size_t ecap = rc.acc_len * 2 + 64;
-            char *esc = malloc(ecap), *resp = malloc(ecap + 1024);
-            json_escape(rc.acc, esc, ecap);
+            char *ctext = strndup(rc.acc, content_len);
+            size_t ecap = content_len * 6 + 64;
+            char *esc = malloc(ecap), *resp = malloc(ecap + (calls ? strlen(calls) : 0) + 1024);
+            json_escape(ctext, esc, ecap);
             int bl = sprintf(resp,
                              "{\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion\",\"model\":\"quarry\","
-                             "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+                             "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"%s%s},"
                              "\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                              "\"total_tokens\":%d}}",
-                             rc.id, esc, finish, st.prompt_tokens, st.gen_tokens, st.prompt_tokens + st.gen_tokens);
+                             rc.id, esc, calls ? ",\"tool_calls\":" : "", calls ? calls : "", finish,
+                             st.prompt_tokens, st.gen_tokens, st.prompt_tokens + st.gen_tokens);
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
             send_all(fd, hdr, n);
             send_all(fd, resp, bl);
-            free(esc); free(resp);
+            free(esc); free(resp); free(ctext);
         }
+        free(calls);
         free(prompt);
         free(rc.acc);
         for (int i = 0; i < nm; i++) { free((void *)roles[i]); free((void *)contents[i]); }
@@ -471,23 +842,101 @@ static void usage(void) {
     fprintf(stderr,
             "quarry - CPU MoE inference with an SSD-backed expert cache\n\n"
             "  quarry run   -m model.gguf [-p prompt] [-n max_tokens] [--temp t] [-c ctx]\n"
-            "  quarry serve -m model.gguf [--host 127.0.0.1] [--port 8090] [-c ctx]\n\n"
+            "  quarry serve -m model.gguf [--host 127.0.0.1] [--port 8090] [-c ctx]\n"
+            "  models: Qwen3-MoE (qwen3moe), Inkling 2 (inkling2_loop; --effort 0..0.99 thinking, default 0.2)\n"
+            "  --skip 0.1   Inkling, lossy: skip experts not in RAM whose routing weight is < 10%% (faster, output changes)\n"
+            "  --experts N  Qwen3-MoE experts per token (default 6 of 8; 8 = exact model)\n\n"
             "env: QUARRY_CACHE_GB (expert cache, default 5.5)  QUARRY_IO_THREADS (default 2)\n");
+}
+
+// prompt processing speed: run the same prompt twice (cold, then warm cache)
+static int cmd_bench_prefill(engine *e, const char *path) {
+    FILE *f = path ? fopen(path, "rb") : NULL;
+    if (!f) { fprintf(stderr, "bench-prefill: -p <text file>\n"); return 1; }
+    static char text[1 << 20];
+    size_t len = fread(text, 1, sizeof text - 1, f);
+    text[len] = 0;
+    fclose(f);
+    int *toks = malloc(sizeof(int) * e->n_ctx);
+    int n = tokenize(e, text, toks, e->n_ctx);
+    if (n <= 0 || n >= e->n_ctx) { fprintf(stderr, "prompt has %d tokens, ctx %d\n", n, e->n_ctx); return 1; }
+    for (int run = 0; run < 2; run++) {
+        memset(qt_pf, 0, sizeof qt_pf);
+        uint64_t b0 = bytes_read(e);
+        e->n_ctx_tokens = 0;
+        double t0 = now();
+        eng_prefill(e, toks, n);
+        double dt = now() - t0;
+        printf("%s: %d tokens in %.1fs = %.1f tok/s | SSD %.2f GB | attn mm %.1fs, attn %.1fs, route %.1fs, experts %.1fs (io wait %.1fs, gate+up %.1fs, down %.1fs)\n",
+               run ? "warm" : "cold", n, dt, n / dt, (bytes_read(e) - b0) / 1e9,
+               qt_pf[0], qt_pf[1], qt_pf[2], qt_pf[3], qt_pf[4], qt_pf[5], qt_pf[6]);
+    }
+    free(toks);
+    return 0;
+}
+
+static char *read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc(n + 1);
+    b[fread(b, 1, n, f)] = 0;
+    fclose(f);
+    return b;
+}
+
+// debug: `quarry render req.json` prints the Qwen prompt for a chat request;
+// `quarry parse-tools req.json output.txt` prints the tool_calls parsed from model output
+static int cmd_debug_tools(int argc, char **argv) {
+    char *body = read_file(argv[2]);
+    if (!body) { perror(argv[2]); return 1; }
+    const char *tools = json_get(body, "tools");
+    if (tools && *skip_ws(tools) != '[') tools = NULL;
+    if (!strcmp(argv[1], "parse-tools")) {
+        char *out = read_file(argv[3]);
+        size_t cl;
+        char *calls = parse_tool_calls(out, tools, 1, &cl);
+        printf("content: [%.*s]\ntool_calls: %s\n", (int)cl, out, calls ? calls : "(none)");
+        return 0;
+    }
+    const char *roles[256], *contents[256], *tcalls[256];
+    int nm = 0;
+    const char *msgs = json_get(body, "messages");
+    if (msgs && *(msgs = skip_ws(msgs)) == '[') {
+        const char *v = msgs + 1;
+        while (nm < 256) {
+            v = skip_ws(v);
+            if (*v != '{') break;
+            const char *r = json_get(v, "role"), *c = json_get(v, "content");
+            roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
+            contents[nm] = c ? content_text(c) : strdup("");
+            tcalls[nm] = json_get(v, "tool_calls");
+            nm++;
+            v = skip_ws(json_skip(v));
+            if (*v == ',') v++; else break;
+        }
+    }
+    fputs(chat_qwen(roles, contents, tcalls, nm, tools), stdout);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
+    if ((!strcmp(argv[1], "render") && argc > 2) || (!strcmp(argv[1], "parse-tools") && argc > 3)) return cmd_debug_tools(argc, argv);
     const char *cmd = argv[1], *model = NULL, *prompt = NULL, *host = "127.0.0.1";
     int n = 1024, port = 8090, ctx = 4096;
-    float temp = 0.7f;
+    float temp = 0.7f, effort = 0.2f;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--experts") && i + 1 < argc) setenv("QUARRY_TOPK", argv[++i], 1);
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
+        else if (!strcmp(argv[i], "--effort") && i + 1 < argc) effort = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--skip") && i + 1 < argc) setenv("QUARRY_SKIP", argv[++i], 1);
         else { usage(); return 1; }
     }
     if (!model) { usage(); return 1; }
@@ -495,12 +944,21 @@ int main(int argc, char **argv) {
     // libgomp reads this before main(), so re-exec once with it set.
     if (!getenv("OMP_WAIT_POLICY")) {
         setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+        char self[4096];
+        ssize_t len = readlink("/proc/self/exe", self, sizeof self - 1);   // real path keeps the process name
+        if (len > 0) { self[len] = 0; execv(self, argv); }
         execv("/proc/self/exe", argv);
     }
     engine e;
+    // Qwen3-MoE default: 6 of its 8 routed experts per token. Same HumanEval score in our
+    // tests, ~10-25% faster. `--experts 8` (or QUARRY_TOPK=8) restores the exact model.
+    if (!getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (eng_load(&e, model, ctx)) { fprintf(stderr, "failed to load %s\n", model); return 1; }
+    e.effort = effort;
+    g_eng = &e;
     if (!strcmp(cmd, "run")) return cmd_run(&e, prompt, n, temp);
     if (!strcmp(cmd, "serve")) return cmd_serve(&e, host, port);
+    if (!strcmp(cmd, "bench-prefill")) return cmd_bench_prefill(&e, prompt);
     usage();
     return 1;
 }

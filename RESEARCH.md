@@ -73,3 +73,34 @@ Validate each stage against llama.cpp logits.
   Profile per token: attention matvecs ~36ms, experts ~95ms (compute-bound),
   router 10ms, output 15ms. Next speedups are on the compute side.
 - [ ] Stage 5: tokenizer, generation loop, OpenAI-compatible server
+
+## Generation speed work (2026-11-22)
+
+Qwen3-Coder generation went from ~5.9 to ~7.0-7.3 tok/s (exact) on the laptop above.
+
+What helped:
+- Q3_K scale decoding wrote 4 x u32 to the stack and reloaded them as one 128-bit
+  value: a store-forwarding stall on every block. Doing it in registers doubled the
+  single-thread kernel speed (6.3 -> 12.8 GB/s); 4 threads from RAM now ~17-21 GB/s.
+- Each expert is 3 file pieces of ~0.7MB (gate/up/down). Reading them one after another
+  ran at ~1.0 GB/s; submitting all three with Linux AIO runs at ~1.5 GB/s (2MB reads reach
+  ~1.7 GB/s).
+- The router's F32 values are exact bf16, so it is stored as bf16: half the reads,
+  bit-identical results.
+- RoPE cos/sin once per token instead of once per head and layer; vectorized attention
+  core and SiLU.
+
+What didn't (measured, reverted):
+- Rearranging Q3_K high bits into lane masks (+7% compute, nothing from RAM), a 4-row
+  kernel (exact but slower: more streams per thread), software prefetch, OpenMP
+  wait policies / spin counts / pinning / dynamic schedules, a bigger cache (7GB: fewer
+  SSD waits but memory pressure cancels it).
+- Speculative decoding with n-gram drafts: verifying 8 tokens in one batch touches the
+  union of their experts (~5x the bytes), so even with every draft accepted it is slower
+  than decoding one token at a time. Not a fit for MoE on this hardware.
+
+Where the time goes (exact, ~140ms/token): experts ~60ms compute + ~15ms SSD waits,
+attention projections ~29ms, output layer ~14ms, router ~5ms, rest ~10ms. RAM read speed
+is ~22GB/s, and ~1.4GB is read per token, so a perfect engine would reach ~15 tok/s; the
+fixed (non-expert) part alone is ~58ms. Using 6 of the 8 routed experts (`--experts 6`)
+cuts expert bytes and SSD reads by 25% and kept the same HumanEval subset score (19/21).

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Compare Quarry's dequantized rows with gguf-py's independent dequantizer.
-# Run with a Python that has numpy + gguf (e.g. ~/midthink/.venv/bin/python).
+# Run with a Python that has numpy + gguf installed.
 import sys
 import numpy as np
 from gguf import GGUFReader

@@ -33,7 +33,8 @@ int main(int argc, char **argv) {
     fclose(f);
     float *lg = NULL;
     t0 = now();
-    for (int i = 0; i < n; i++) lg = model_forward(&m, ids[i], i);
+    if (getenv("QUARRY_PER_TOKEN")) for (int i = 0; i < n; i++) lg = model_forward(&m, ids[i], i);
+    else lg = model_prefill(&m, ids, n, 0);
     double dt = now() - t0;
     int nv = m.c.n_vocab;
     float *ref = malloc(nv * 4);
