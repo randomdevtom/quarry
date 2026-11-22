@@ -11,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #include "quants.h"
 
@@ -246,6 +247,13 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     }
     expert_src src = {g->fd, g->file_size, nl, c->n_expert, 3, off, bytes,
                       &m->expert_bytes_read, &m->expert_loads, 2 * c->n_used + 4};
+    // <model>.experts: experts repacked so each one is a single contiguous read. Faster in a
+    // raw read test (1.45 vs 1.07 GB/s) but slower inside the engine on our laptop (I/O wait
+    // 21s vs 14s), so opt-in: QUARRY_WRITE_PACKED=1 creates it, QUARRY_PACKED=1 uses it.
+    char packed[4096];
+    snprintf(packed, sizeof packed, "%s.experts", path);
+    if (getenv("QUARRY_WRITE_PACKED") && experts_write_packed(&src, packed)) fprintf(stderr, "quarry: packing failed\n");
+    if (getenv("QUARRY_PACKED") && access(packed, R_OK) == 0) src.packed = packed;
     m->experts = experts_open_src(&src);
     free(off); free(bytes);
     m->prefetch_on = getenv("QUARRY_NO_PREFETCH") ? 0 : 1;

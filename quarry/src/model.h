@@ -62,7 +62,11 @@ typedef struct {
     const uint64_t *off, *bytes;       // [layer * n_parts + part]: offset of expert 0, bytes per expert
     uint64_t *bytes_read, *loads;      // counters updated by the I/O threads
     int min_slots;
+    const char *packed;                // optional file with each expert's parts back to back
 } expert_src;
+// write src's experts to `path`, each expert's parts back to back in its cache-slot layout,
+// so a miss is one contiguous read. Returns 0 on success.
+int experts_write_packed(const expert_src *src, const char *path);
 struct expert_store *experts_open_src(const expert_src *src);
 struct expert_store *experts_open(qmodel *m);
 // returns pointers to gate/up/down weights of expert e in layer l, valid until next call

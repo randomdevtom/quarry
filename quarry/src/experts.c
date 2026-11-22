@@ -44,6 +44,9 @@ struct expert_store {
     uint64_t slot_bytes;        // largest slot (staging slots use it)
     int *layer_cls;             // [layer] size class
     uint64_t *in_slot;          // [layer * n_parts + part]: offset of the part inside a slot
+    uint64_t *lsz;              // [layer] slot bytes for that layer's experts
+    int fd_packed;              // packed expert file (O_DIRECT), or -1
+    uint64_t *pk_base;          // [layer] offset of the layer's expert 0 in the packed file
     // I/O queue (ring of slot ids)
     int *q, q_cap, q_head, q_len;
     pthread_mutex_t mu;
@@ -105,15 +108,21 @@ static const uint8_t *read_direct(struct expert_store *s, uint8_t *dst, uint64_t
 
 // read all parts of an expert at once with kernel AIO (O_DIRECT): the parts are ~0.7 MB
 // apart in the file, and three requests in flight read ~1.5x faster than one after another
+static int aio_read_fd(struct expert_store *s, int fd, uint64_t fsize, aio_context_t ctx, int n, uint8_t **dst,
+                       const uint64_t *off, const uint64_t *len, const uint8_t **out);
 static int aio_read_parts(struct expert_store *s, aio_context_t ctx, int n, uint8_t **dst,
                           const uint64_t *off, const uint64_t *len, const uint8_t **out) {
+    return aio_read_fd(s, s->fd_direct, s->file_size, ctx, n, dst, off, len, out);
+}
+static int aio_read_fd(struct expert_store *s, int fd, uint64_t fsize, aio_context_t ctx, int n, uint8_t **dst,
+                       const uint64_t *off, const uint64_t *len, const uint8_t **out) {
     struct iocb cb[8], *cbs[8];
     for (int k = 0; k < n; k++) {
         const uint64_t a0 = off[k] & ~(uint64_t)(ALIGN - 1);
         uint64_t a1 = (off[k] + len[k] + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
-        if (a1 > s->file_size) return -1;      // tail not aligned: caller falls back
+        if (a1 > fsize) return -1;             // tail not aligned: caller falls back
         memset(&cb[k], 0, sizeof cb[k]);
-        cb[k].aio_fildes = s->fd_direct;
+        cb[k].aio_fildes = fd;
         cb[k].aio_lio_opcode = IOCB_CMD_PREAD;
         cb[k].aio_buf = (uint64_t)(uintptr_t)dst[k];
         cb[k].aio_nbytes = a1 - a0;
@@ -162,6 +171,7 @@ static void *io_worker(void *arg) {
         int key = s->slots[i].key;
         pthread_mutex_unlock(&s->mu);
         uint8_t *mem = s->slots[i].mem;
+        const double t_rd = now_s();
         const uint8_t *p[3] = {NULL, NULL, NULL};
         uint64_t total = 0;
         uint8_t *dst[3];
@@ -172,8 +182,35 @@ static void *io_worker(void *arg) {
             len[k] = part_len(s, key, k);
             total += len[k];
         }
-        if (!use_aio || aio_read_parts(s, ctx, s->n_parts, dst, off, len, p) != 0)
+        if (s->fd_packed >= 0) {
+            // packed file: the whole slot image in one contiguous read
+            const int l = key / s->n_expert;
+            const uint64_t po = s->pk_base[l] + (uint64_t)(key % s->n_expert) * s->lsz[l], n = s->lsz[l];
+            // split into QUARRY_PK_SPLIT requests in flight (AIO), default 2
+            static int nsplit = -1;
+            if (nsplit < 0) { nsplit = getenv("QUARRY_PK_SPLIT") ? atoi(getenv("QUARRY_PK_SPLIT")) : 2; if (nsplit < 1) nsplit = 1; if (nsplit > 8) nsplit = 8; }
+            uint8_t *dd[8]; uint64_t oo[8], ll[8]; const uint8_t *pp[8];
+            const uint64_t chunk = (n / nsplit + ALIGN - 1) / ALIGN * ALIGN;
+            int ns = 0;
+            for (uint64_t at = 0; at < n; at += chunk, ns++) { dd[ns] = mem + at; oo[ns] = po + at; ll[ns] = n - at < chunk ? n - at : chunk; }
+            if (!use_aio || aio_read_fd(s, s->fd_packed, s->pk_base[s->n_layer - 1] + s->lsz[s->n_layer - 1] * s->n_expert, ctx, ns, dd, oo, ll, pp) != 0) {
+                uint64_t done = 0;
+                while (done < n) {
+                    ssize_t r = pread(s->fd_packed, mem + done, n - done, po + done);
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r <= 0) { perror("packed expert read"); exit(1); }
+                    done += r;
+                }
+            }
+            for (int k = 0; k < s->n_parts; k++) p[k] = mem + s->in_slot[l * s->n_parts + k];
+        } else if (!use_aio || aio_read_parts(s, ctx, s->n_parts, dst, off, len, p) != 0)
             for (int k = 0; k < s->n_parts; k++) p[k] = read_direct(s, dst[k], off[k], len[k]);
+        if (getenv("QUARRY_IO_DEBUG")) {
+            static double tsum; static uint64_t nrd, bsum;
+            __atomic_fetch_add(&nrd, 1, __ATOMIC_RELAXED);
+            pthread_mutex_lock(&s->mu); tsum += now_s() - t_rd; bsum += total; pthread_mutex_unlock(&s->mu);
+            if (nrd % 3000 == 0) fprintf(stderr, "[io: %llu reads, avg %.2f ms, %.2f GB/s per thread]\n", (unsigned long long)nrd, 1e3 * tsum / nrd, bsum / tsum / 1e9);
+        }
         pthread_mutex_lock(&s->mu);
         for (int k = 0; k < 3; k++) s->slots[i].p[k] = p[k];
         s->slots[i].state = S_READY;
@@ -248,6 +285,51 @@ static int request(struct expert_store *s, int key, int demand) {
     return i;
 }
 
+// slot layout per layer: parts back to back, each with room for its aligned read window
+static void slot_layout(const expert_src *src, uint64_t *in_slot, uint64_t *lsize) {
+    for (int l = 0; l < src->n_layer; l++) {
+        uint64_t o = 0;
+        for (int k = 0; k < src->n_parts; k++) {
+            in_slot[l * src->n_parts + k] = o;
+            o += (src->bytes[l * src->n_parts + k] + 2 * ALIGN + ALIGN - 1) / ALIGN * ALIGN;
+        }
+        lsize[l] = o;
+    }
+}
+
+int experts_write_packed(const expert_src *src, const char *path) {
+    const int np = src->n_layer * src->n_parts;
+    uint64_t *in_slot = malloc(np * sizeof(uint64_t)), *lsize = malloc(src->n_layer * sizeof(uint64_t));
+    slot_layout(src, in_slot, lsize);
+    uint64_t mx = 0;
+    for (int l = 0; l < src->n_layer; l++) if (lsize[l] > mx) mx = lsize[l];
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { perror(tmp); return -1; }
+    uint8_t *buf = malloc(mx);
+    for (int l = 0; l < src->n_layer; l++) {
+        for (int e = 0; e < src->n_expert; e++) {
+            memset(buf, 0, lsize[l]);
+            for (int k = 0; k < src->n_parts; k++) {
+                const int i = l * src->n_parts + k;
+                uint64_t off = src->off[i] + (uint64_t)e * src->bytes[i], n = src->bytes[i], done = 0;
+                while (done < n) {
+                    ssize_t r = pread(src->fd, buf + in_slot[i] + done, n - done, off + done);
+                    if (r <= 0) { perror("pack read"); fclose(f); return -1; }
+                    done += r;
+                }
+            }
+            if (fwrite(buf, 1, lsize[l], f) != lsize[l]) { perror("pack write"); fclose(f); return -1; }
+        }
+        fprintf(stderr, "\rquarry: packing experts, layer %d/%d", l + 1, src->n_layer);
+    }
+    fprintf(stderr, "\n");
+    free(buf); free(in_slot); free(lsize);
+    if (fflush(f) || fsync(fileno(f)) || fclose(f)) { perror("pack close"); return -1; }
+    return rename(tmp, path);
+}
+
 struct expert_store *experts_open_src(const expert_src *src) {
     struct expert_store *s = calloc(1, sizeof *s);
     s->fd = src->fd; s->file_size = src->file_size;
@@ -257,18 +339,23 @@ struct expert_store *experts_open_src(const expert_src *src) {
     s->src_off = malloc(np * sizeof(uint64_t)); s->src_bytes = malloc(np * sizeof(uint64_t));
     memcpy(s->src_off, src->off, np * sizeof(uint64_t));
     memcpy(s->src_bytes, src->bytes, np * sizeof(uint64_t));
-    // slot layout per layer: parts back to back, each with room for its aligned read window
     s->in_slot = malloc(np * sizeof(uint64_t));
     uint64_t *lsize = malloc(s->n_layer * sizeof(uint64_t));
+    slot_layout(src, s->in_slot, lsize);
     s->slot_bytes = 0;
-    for (int l = 0; l < s->n_layer; l++) {
+    for (int l = 0; l < s->n_layer; l++) if (lsize[l] > s->slot_bytes) s->slot_bytes = lsize[l];
+    s->lsz = lsize;
+    s->fd_packed = -1;
+    if (src->packed) {
+        s->pk_base = malloc(s->n_layer * sizeof(uint64_t));
         uint64_t o = 0;
-        for (int k = 0; k < s->n_parts; k++) {
-            s->in_slot[l * s->n_parts + k] = o;
-            o += (s->src_bytes[l * s->n_parts + k] + 2 * ALIGN + ALIGN - 1) / ALIGN * ALIGN;
+        for (int l = 0; l < s->n_layer; l++) { s->pk_base[l] = o; o += lsize[l] * s->n_expert; }
+        int fdp = open(src->packed, O_RDONLY | O_DIRECT);
+        if (fdp >= 0 && (uint64_t)lseek(fdp, 0, SEEK_END) == o) s->fd_packed = fdp;
+        else {
+            if (fdp >= 0) close(fdp);
+            fprintf(stderr, "quarry: %s does not match this model, not used\n", src->packed);
         }
-        lsize[l] = o;
-        if (o > s->slot_bytes) s->slot_bytes = o;
     }
     // size classes: layers with the same slot size share slots
     int ncls = 0, cls_layers[64] = {0};
@@ -318,7 +405,6 @@ struct expert_store *experts_open_src(const expert_src *src) {
         s->slots[i] = (slot_t){.key = -1, .prev = -1, .next = -1, .mem = mem, .cls = -1};
         mem += s->slot_bytes;
     }
-    free(lsize);
     s->q_cap = s->n_slots + s->n_stage + 8;
     s->q = malloc(s->q_cap * sizeof(int));
     char p[64];
