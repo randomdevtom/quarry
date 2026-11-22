@@ -72,15 +72,38 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 Logits match llama.cpp (cosine 0.9998, same top token); every one of its 48 layer slots
 matches at cosine >= 0.997.
 
-## Build
-
-Needs gcc with AVX-512 VNNI, OpenMP, and libllama from llama.cpp (used only for the
-tokenizer). Inkling needs a recent llama.cpp: if `vendor/llama.cpp` is built, the
-Makefile links it.
+## Install
 
 ```sh
-cd quarry && make
+git clone https://github.com/randomdevtom/quarry && cd quarry
+./install.sh
 ```
+
+The installer:
+
+1. checks the CPU (AVX-512 VNNI), RAM and build tools, and prints the package command if any are missing
+2. builds llama.cpp's tokenizer library (pinned, tested version) and Quarry, and links `~/.local/bin/quarry`
+3. downloads the default model (Qwen3.8-35B-A3B Distill, Q3_K_M, 17.7GB), or uses `--model your.gguf`
+4. sizes the expert cache to your RAM and writes `~/.config/quarry/quarry.env`
+5. runs Quarry as a systemd user service (starts at login), serving the chat page and the API on port 8090
+6. optionally shares the chat on your Tailscale tailnet (`tailscale serve`, HTTPS, tailnet only)
+7. optionally adds Quarry as a provider in opencode
+
+`./install.sh --yes` takes the defaults without asking. Other options: `--port`, `--ctx`,
+`--cache GB`, `--models-dir`, `--no-service`, `--tailscale`, `--opencode`. `./install.sh --uninstall`
+removes the service, config and link (models and the build stay).
+
+To build by hand instead: gcc with AVX-512 VNNI and OpenMP, plus libllama (tokenizer only;
+`vendor/llama.cpp` is used when built), then `cd quarry && make`.
+
+## Chat
+
+Open http://127.0.0.1:8090/ once the server runs. Streaming replies, optional thinking
+(shown live in a collapsible box), code blocks with copy, chat history kept in the browser,
+and an engine panel: context used, expert cache hit rate, SSD reads, draft acceptance and
+live tok/s. Works on a phone, light and dark.
+
+<p><img src="docs/chat.png" alt="Quarry chat page" width="72%"> <img src="docs/chat-phone.png" alt="Quarry chat on a phone" width="24%"></p>
 
 ## Use
 
@@ -90,7 +113,10 @@ QUARRY_CACHE_GB=6.5 ./build/quarry run -m Qwen3-Coder-30B-A3B-Instruct-Q3_K_S.gg
 
 # OpenAI-compatible server: streaming, tool calls, prompt-prefix reuse across turns
 QUARRY_CACHE_GB=6.0 ./build/quarry serve -m model.gguf --port 8090 -c 32768
-# -> http://127.0.0.1:8090/v1/chat/completions
+# -> chat page at http://127.0.0.1:8090/, API at /v1/chat/completions, engine stats at /v1/stats
+
+# installed as a service: edit ~/.config/quarry/quarry.env, then
+systemctl --user restart quarry
 ```
 
 Options:
@@ -105,7 +131,7 @@ Options:
 
 ### opencode
 
-Add a provider to `~/.config/opencode/opencode.json`:
+`./install.sh --opencode` adds this for you. By hand, add a provider to `~/.config/opencode/opencode.json`:
 
 ```json
 {

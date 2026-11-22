@@ -33,7 +33,11 @@ typedef struct {
     ink_model im;
     q35_model qm;
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
-    int (*reason_emit)(const char *, void *);   // if set: thinking text goes here (HTTP reasoning_content)
+    int (*reason_emit)(const char *, void *);
+    char model_name[256];              // GGUF file name, shown by the chat page
+    int last_prompt, last_gen;         // last request: tokens and seconds (for /v1/stats)
+    double last_t_prompt, last_t_gen;
+    long n_requests;   // if set: thinking text goes here (HTTP reasoning_content)
     int t_think_end, think, think_default;   // q35: "</think>" token; thinking on for this request / by default
     // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
     int t_think, t_text, t_end_msg, t_msg_model, mode, show_thinking;
@@ -955,6 +959,25 @@ static void handle(engine *e, int fd) {
         const char *b = "{\"status\":\"ok\"}";
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
         send_all(fd, hdr, n);
+    } else if (!strcmp(path, "/v1/stats")) {
+        // engine state for the chat page: model, context, expert cache, speculation, last request
+        struct expert_store *es = eng_experts(e);
+        uint64_t h = 0, mi = 0, pi = 0, pu = 0;
+        experts_stats(es, &h, &mi, &pi, &pu);
+        char b[1024];
+        const int spec = e->q35 && e->qm.has_mtp && !getenv("QUARRY_NO_SPEC");
+        const double acc = e->q35 && e->qm.spec_steps ? (double)e->qm.spec_accepted / e->qm.spec_steps : 0;
+        int bl = snprintf(b, sizeof b,
+            "{\"model\":\"%s\",\"arch\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,\"cache_gb\":%.1f,"
+            "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
+            "\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
+            e->model_name, e->q35 ? "qwen35moe" : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
+            getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
+            h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
+            e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
+        int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
+        send_all(fd, hdr, n);
+        send_all(fd, b, bl);
     } else if (!strcmp(path, "/v1/models")) {
         const char *b = "{\"object\":\"list\",\"data\":[{\"id\":\"quarry\",\"object\":\"model\",\"owned_by\":\"local\"}]}";
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
@@ -1004,6 +1027,9 @@ static void handle(engine *e, int fd) {
         e->reason_emit = emit_reason_http;
         eng_generate(e, prompt, max_tokens, temp, top_p, emit_http, &rc, &st);
         e->reason_emit = NULL;
+        e->last_prompt = st.prompt_tokens; e->last_gen = st.gen_tokens;
+        e->last_t_prompt = st.t_prompt; e->last_t_gen = st.t_gen;
+        e->n_requests++;
         fprintf(stderr, "[req: %d msgs, %d prompt tok (%.1fs), %d gen tok, %.2f tok/s]\n", nm, st.prompt_tokens,
                 st.t_prompt, st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
         const char *finish = st.gen_tokens >= max_tokens ? "length" : "stop";
@@ -1195,6 +1221,11 @@ int main(int argc, char **argv) {
     }
     engine e;
     if (eng_load(&e, model, ctx)) { fprintf(stderr, "failed to load %s\n", model); return 1; }
+    {
+        const char *base = strrchr(model, '/');
+        snprintf(e.model_name, sizeof e.model_name, "%s", base ? base + 1 : model);
+        for (char *c = e.model_name; *c; c++) if (*c == '"' || *c == '\\') *c = '_';
+    }
     e.effort = effort;
     e.think_default = think_flag;
     g_eng = &e;
