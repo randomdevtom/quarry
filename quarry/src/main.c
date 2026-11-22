@@ -150,8 +150,7 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
         if (!(common == e->n_ctx_tokens && common > 0)) {
             if (e->snap_pos > 0 && common >= e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; }
             else {
-                memset(e->qm.S, 0, (size_t)e->qm.n_rec * e->qm.c.n_vh * e->qm.c.dv * e->qm.c.dk * 4);
-                memset(e->qm.conv, 0, (size_t)e->qm.n_rec * (e->qm.c.n_conv - 1) * e->qm.c.conv_dim * 4);
+                q35_state_reset(&e->qm);
                 common = 0;
             }
         }
@@ -171,6 +170,51 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
 // generation callback: return nonzero to stop
 typedef int (*emit_fn)(const char *text, void *ud);
 
+// print one generated token (thinking/answer handling); nonzero to stop
+static int emit_tok(engine *e, int tok, int g, char *buf, int cap, emit_fn emit, void *ud) {
+    int stop = 0;
+    if (e->q35 && tok == e->t_think_end && e->mode == 1) {
+        // end of the thinking block: what follows is the answer
+        if (e->show_thinking) stop = emit("\033[0m\n", ud);
+        e->mode = 2;
+    } else if (e->q35 && e->mode == 1) {
+        piece(e, tok, buf, cap);
+        if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
+    } else if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
+        // Inkling structure tokens: switch between thinking and answer, print nothing
+        const int was = e->mode;
+        e->mode = tok == e->t_think ? 1 : tok == e->t_text ? 2 : 0;
+        if (e->show_thinking && was == 1 && e->mode != 1) stop = emit("\033[0m\n", ud);
+        if (e->show_thinking && e->mode == 1) stop = emit("\033[2m", ud);
+    } else {
+        piece(e, tok, buf, cap);
+        if (e->mode == 2) stop = emit(buf, ud);
+        else if (e->mode == 1 && e->show_thinking) stop = emit(buf, ud);
+    }
+    return stop;
+}
+
+// probability of `tok` under sample()'s distribution (temperature, top-p over the top 64)
+static float sample_prob(engine *e, const float *lg, float temp, float top_p, int tok) {
+    enum { K = 64 };
+    int idx[K], n = 0;
+    const int nv = n_vocab(e);
+    for (int i = 0; i < nv; i++) {
+        if (n < K || lg[i] > lg[idx[n - 1]]) {
+            int j = n < K ? n++ : K - 1;
+            while (j > 0 && lg[idx[j - 1]] < lg[i]) { idx[j] = idx[j - 1]; j--; }
+            idx[j] = i;
+        }
+    }
+    float p[K], tot = 0, mx = lg[idx[0]];
+    for (int j = 0; j < n; j++) { p[j] = expf((lg[idx[j]] - mx) / temp); tot += p[j]; }
+    float cum = 0;
+    int cut = n;
+    for (int j = 0; j < n; j++) { cum += p[j] / tot; if (cum >= top_p) { cut = j + 1; break; } }
+    for (int j = 0; j < cut; j++) if (idx[j] == tok) return p[j] / tot / cum;
+    return 0;
+}
+
 typedef struct { int prompt_tokens, gen_tokens; double t_prompt, t_gen; } gen_stats;
 
 static void eng_generate(engine *e, const char *prompt, int max_tokens, float temp, float top_p,
@@ -187,32 +231,48 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     char buf[256];
     int pos = n, g = 0;
     e->mode = e->ink ? 0 : e->q35 && e->think ? 1 : 2;
-    for (; g < max_tokens; g++) {
+    // Qwen3.5/3.6 with an MTP layer: draft one token, verify two at a time (output unchanged:
+    // greedy keeps the draft only if it is the argmax; sampling uses the speculative rule)
+    const int spec = e->q35 && e->qm.has_mtp && !getenv("QUARRY_NO_SPEC");
+    while (g < max_tokens) {
         int tok = sample(e, lg, temp, top_p);
         if (is_eog(e, tok)) break;
-        int stop = 0;
-        if (e->q35 && tok == e->t_think_end && e->mode == 1) {
-            // end of the thinking block: what follows is the answer
-            if (e->show_thinking) stop = emit("\033[0m\n", ud);
-            e->mode = 2;
-        } else if (e->q35 && e->mode == 1) {
-            piece(e, tok, buf, sizeof buf);
-            if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
-        } else if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
-            // Inkling structure tokens: switch between thinking and answer, print nothing
-            const int was = e->mode;
-            e->mode = tok == e->t_think ? 1 : tok == e->t_text ? 2 : 0;
-            if (e->show_thinking && was == 1 && e->mode != 1) stop = emit("\033[0m\n", ud);
-            if (e->show_thinking && e->mode == 1) stop = emit("\033[2m", ud);
-        } else {
-            piece(e, tok, buf, sizeof buf);
-            if (e->mode == 2) stop = emit(buf, ud);
-            else if (e->mode == 1 && e->show_thinking) { e->mode = 1; stop = emit(buf, ud); }
-        }
-        if (stop) { g++; break; }
+        int stop = emit_tok(e, tok, g, buf, sizeof buf, emit, ud);
+        g++;
+        if (stop) break;
         e->ctx_tokens[pos] = tok;
-        lg = fwd(e, tok, pos++);
-        e->n_ctx_tokens = pos;
+        if (spec && g < max_tokens && pos + 2 < e->n_ctx) {
+            const int d = q35_draft(&e->qm, tok, pos);
+            q35_forward2(&e->qm, tok, d, pos);
+            float *l0 = e->qm.logits2[0], *l1 = e->qm.logits2[1];
+            int acc;
+            if (temp <= 0) {
+                int best = 0;
+                for (int i = 1; i < n_vocab(e); i++) if (l0[i] > l0[best]) best = i;
+                acc = best == d;
+            } else {
+                acc = frand(e) < sample_prob(e, l0, temp, top_p, d);
+                if (!acc) l0[d] = -INFINITY;   // resample from the rest
+            }
+            q35_commit(&e->qm, acc);
+            if (acc) {
+                e->ctx_tokens[pos + 1] = d;
+                pos += 2;
+                e->n_ctx_tokens = pos;
+                lg = l1;
+                if (is_eog(e, d)) break;
+                stop = emit_tok(e, d, g, buf, sizeof buf, emit, ud);
+                g++;
+                if (stop) break;
+            } else {
+                pos += 1;
+                e->n_ctx_tokens = pos;
+                lg = l0;
+            }
+        } else {
+            lg = fwd(e, tok, pos++);
+            e->n_ctx_tokens = pos;
+        }
     }
     st->gen_tokens = g;
     st->t_gen = now() - t0;
@@ -300,6 +360,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
                                 100.0 * e->im.pred_correct / (e->im.pred_total + 1e-9),
                                 100.0 * e->im.pred2_correct / (e->im.pred_total + 1e-9), ink_prof[0], ink_prof[1], ink_prof[2], ink_prof[3]);
             if (e->ink && e->im.skipped) fprintf(stderr, " | skipped %llu experts", (unsigned long long)e->im.skipped);
+            if (e->q35 && e->qm.spec_steps) fprintf(stderr, " | MTP: %llu steps, %.0f%% drafts accepted, draft %.1fs",
+                                (unsigned long long)e->qm.spec_steps, 100.0 * e->qm.spec_accepted / e->qm.spec_steps, e->qm.draft_seconds);
             if (e->q35) fprintf(stderr, " | prediction %.0f%% | delta-net %.1fs attn %.1fs route %.1fs experts %.1fs shared %.1fs output %.1fs (delta-net proj %.1fs, conv+recur %.1fs)",
                                 100.0 * e->qm.pred_correct / (e->qm.pred_total + 1e-9), q35_prof[0], q35_prof[1], q35_prof[2], q35_prof[3], q35_prof[4], q35_prof[5], q35_prof[6], q35_prof[7]);
             if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);

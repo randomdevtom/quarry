@@ -96,3 +96,8 @@ float vec_dot_q8_0_a32(int n, const block_q8_0 *x, act32 a);
 float vec_dot_q5_0_a32(int n, const block_q5_0 *x, act32 a);
 float vec_dot_q4_K_q8_K(int n, const block_q4_K *x, const block_q8_K *y);
 float vec_dot_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y);
+
+// two activation vectors per weight row: r0 = row . y0, r1 = row . y1 (unpacking shared)
+void vec_dot2_q3_K_q8_K(int n, const block_q3_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);
+void vec_dot2_q4_K_q8_K(int n, const block_q4_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);
+void vec_dot2_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);

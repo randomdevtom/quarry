@@ -43,7 +43,8 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 
 | | |
 |---|---|
-| generation, short context (default: 6 of 8 experts, 5GB cache) | ~6.6-6.8 tok/s |
+| generation, short context (default: 6 of 8 experts, MTP speculation, 5GB cache) | ~6.2-7.6 tok/s |
+| generation without speculation (`QUARRY_NO_SPEC=1`) | ~6.6-6.8 tok/s |
 | generation, exact (`--experts 8`) | ~5.8 tok/s |
 | generation at 12.6K context | ~4.6 tok/s |
 | prompt processing | ~28 tok/s (5K tokens), ~21 tok/s (12.6K tokens) |
@@ -52,6 +53,10 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 - logits match llama.cpp (cosine 0.998, same top token), token by token and batched
 - opencode end to end (write a file, run it): first turn 10 min (12.6K-token prompt),
   later turns reuse the cached prefix (~3s of prompt processing)
+- speculative decoding with the model's own MTP layer: it drafts one token, and the main model
+  verifies two tokens per pass (weight rows unpacked once for both tokens). ~90% of drafts are
+  accepted on code; greedy output is unchanged, sampling uses the standard speculative rule.
+  HumanEval subset with speculation: 20/21, 44s/task
 - thinking is off by default; `--think` or `"chat_template_kwargs": {"enable_thinking": true}`
 - the output layer (248K vocab) runs from a 4-bit copy that picks 64 candidates, whose exact
   logits are computed from the file's rows (`QUARRY_EXACT_OUTPUT=1` keeps the full matrix in RAM)

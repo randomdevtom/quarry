@@ -75,6 +75,11 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
 #define K(s) "qwen35moe." s
     // block_count includes the MTP layer(s) at the end
     c->n_layer = qg_get_int(g, K("block_count"), 0) - qg_get_int(g, K("nextn_predict_layers"), 0);
+    {
+        char t[64];
+        snprintf(t, sizeof t, "blk.%d.nextn.eh_proj.weight", c->n_layer);
+        m->has_mtp = qg_get_int(g, K("nextn_predict_layers"), 0) >= 1 && qg_find_tensor(g, t) && !getenv("QUARRY_NO_MTP");
+    }
     c->n_embd = qg_get_int(g, K("embedding_length"), 0);
     c->n_head = qg_get_int(g, K("attention.head_count"), 0);
     c->n_head_kv = qg_get_int(g, K("attention.head_count_kv"), 0);
@@ -147,17 +152,25 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
             free(raw);
         }
     }
-    m->layers = calloc(c->n_layer, sizeof(q35_layer));
+    m->layers = calloc(c->n_layer + 1, sizeof(q35_layer));
     m->attn_idx = malloc(c->n_layer * sizeof(int));
     m->rec_idx = malloc(c->n_layer * sizeof(int));
     char nm[128];
 #define NM(s) (snprintf(nm, sizeof nm, "blk.%d." s, l), nm)
-    for (int l = 0; l < c->n_layer; l++) {
+    for (int l = 0; l < c->n_layer + m->has_mtp; l++) {
         q35_layer *L = &m->layers[l];
-        const int rec = arr_int(g, K("attention.recurrent_layers"), l, (l + 1) % interval != 0);
-        L->is_attn = !rec;
-        m->attn_idx[l] = L->is_attn ? m->n_attn++ : -1;
-        m->rec_idx[l] = L->is_attn ? -1 : m->n_rec++;
+        if (l == c->n_layer) {   // MTP block: full attention, its own KV
+            L->is_attn = 1;
+            m->eh_proj = mat(g, NM("nextn.eh_proj.weight"), 1, 1);
+            m->mtp_enorm = f32(g, NM("nextn.enorm.weight"));
+            m->mtp_hnorm = f32(g, NM("nextn.hnorm.weight"));
+            m->mtp_head_norm = qg_find_tensor(g, NM("nextn.shared_head_norm.weight")) ? f32(g, NM("nextn.shared_head_norm.weight")) : m->output_norm;
+        } else {
+            const int rec = arr_int(g, K("attention.recurrent_layers"), l, (l + 1) % interval != 0);
+            L->is_attn = !rec;
+            m->attn_idx[l] = L->is_attn ? m->n_attn++ : -1;
+            m->rec_idx[l] = L->is_attn ? -1 : m->n_rec++;
+        }
         L->attn_norm = f32(g, NM("attn_norm.weight"));
         L->post_norm = f32(g, NM("post_attention_norm.weight"));
         if (L->is_attn) {
@@ -205,20 +218,34 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     const int kvd = c->n_head_kv * c->hd;
     m->kc = xalloc((size_t)m->n_attn * n_ctx * kvd * 2);
     m->vc = xalloc((size_t)m->n_attn * n_ctx * kvd * 2);
-    m->S = xalloc((size_t)m->n_rec * c->n_vh * c->dv * c->dk * 4);
+    const size_t hsz = (size_t)c->n_vh * c->dv * c->dk;
+    m->S = xalloc((size_t)m->n_rec * hsz * 4);
+    m->sp = malloc(m->n_rec * sizeof(float *));
+    m->sp_alt = malloc(m->n_rec * sizeof(float *));
+    for (int r = 0; r < m->n_rec; r++) m->sp[r] = m->S + (size_t)r * hsz;
+    if (m->has_mtp) {
+        m->S2 = xalloc((size_t)m->n_rec * hsz * 4);
+        for (int r = 0; r < m->n_rec; r++) m->sp_alt[r] = m->S2 + (size_t)r * hsz;
+        m->conv_bk = xalloc((size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+        m->mtp_kc = xalloc((size_t)n_ctx * kvd * 2);
+        m->mtp_vc = xalloc((size_t)n_ctx * kvd * 2);
+        for (int t = 0; t < 2; t++) { m->h2[t] = xalloc(c->n_embd * 4); m->logits2[t] = xalloc((size_t)c->n_vocab * 4); }
+    }
+    m->hlast = xalloc(c->n_embd * 4);
     m->conv = xalloc((size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
     m->logits = xalloc((size_t)c->n_vocab * 4);
-    m->pred = calloc((size_t)c->n_layer * 16, sizeof(int));
+    m->pred = calloc((size_t)(c->n_layer + 1) * 16, sizeof(int));
 
     // experts: three parts (gate, up, down); their types differ by layer
-    uint64_t *off = malloc(c->n_layer * 3 * sizeof(uint64_t)), *bytes = malloc(c->n_layer * 3 * sizeof(uint64_t));
-    for (int l = 0; l < c->n_layer; l++) {
+    const int nl = c->n_layer + m->has_mtp;
+    uint64_t *off = malloc(nl * 3 * sizeof(uint64_t)), *bytes = malloc(nl * 3 * sizeof(uint64_t));
+    for (int l = 0; l < nl; l++) {
         const q35_layer *L = &m->layers[l];
         const qmat *P[3] = {&L->gate_exps, &L->up_exps, &L->down_exps};
         for (int p = 0; p < 3; p++) { off[l * 3 + p] = P[p]->file_off; bytes[l * 3 + p] = P[p]->row_bytes * P[p]->rows; }
     }
-    expert_src src = {g->fd, g->file_size, c->n_layer, c->n_expert, 3, off, bytes,
-                      &m->expert_bytes_read, &m->expert_loads, 2 * c->n_used};
+    expert_src src = {g->fd, g->file_size, nl, c->n_expert, 3, off, bytes,
+                      &m->expert_bytes_read, &m->expert_loads, 2 * c->n_used + 4};
     m->experts = experts_open_src(&src);
     free(off); free(bytes);
     m->prefetch_on = getenv("QUARRY_NO_PREFETCH") ? 0 : 1;
@@ -231,15 +258,23 @@ size_t q35_state_bytes(const q35_model *m) {
 }
 void q35_state_save(const q35_model *m, void *dst) {
     const q35_cfg *c = &m->c;
-    const size_t s = (size_t)m->n_rec * c->n_vh * c->dv * c->dk * 4;
-    memcpy(dst, m->S, s);
-    memcpy((char *)dst + s, m->conv, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+    const size_t h = (size_t)c->n_vh * c->dv * c->dk * 4;
+    for (int r = 0; r < m->n_rec; r++) memcpy((char *)dst + r * h, m->sp[r], h);
+    memcpy((char *)dst + m->n_rec * h, m->conv, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
 }
 void q35_state_load(q35_model *m, const void *src) {
     const q35_cfg *c = &m->c;
-    const size_t s = (size_t)m->n_rec * c->n_vh * c->dv * c->dk * 4;
-    memcpy(m->S, src, s);
-    memcpy(m->conv, (const char *)src + s, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+    const size_t h = (size_t)c->n_vh * c->dv * c->dk * 4;
+    for (int r = 0; r < m->n_rec; r++) memcpy(m->sp[r], (const char *)src + r * h, h);
+    memcpy(m->conv, (const char *)src + m->n_rec * h, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+    m->mtp_n = 0;
+}
+void q35_state_reset(q35_model *m) {
+    const q35_cfg *c = &m->c;
+    const size_t h = (size_t)c->n_vh * c->dv * c->dk * 4;
+    for (int r = 0; r < m->n_rec; r++) memset(m->sp[r], 0, h);
+    memset(m->conv, 0, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+    m->mtp_n = 0;
 }
 
 // ---------------- small ops ----------------
@@ -341,10 +376,12 @@ typedef struct {
     block_q8_K *qk, *qk2;
     int8_t *a_qs, *a_qs2; float *a_d, *a_d2; int32_t *a_s, *a_s2;
 } scratch;
-static scratch *scr(q35_model *m) {
-    static scratch s;
-    static int init;
-    if (init) return &s;
+static scratch *scr_init(q35_model *m, scratch *sp, int *init);
+static scratch *scr(q35_model *m) { static scratch s; static int init; return scr_init(m, &s, &init); }
+static scratch *scr1(q35_model *m) { static scratch s; static int init; return scr_init(m, &s, &init); }
+static scratch *scr_init(q35_model *m, scratch *sp, int *initp) {
+    if (*initp) return sp;
+    scratch s;
     const q35_cfg *c = &m->c;
     int mx = c->conv_dim;
     if (c->n_head * c->hd * 2 > mx) mx = c->n_head * c->hd * 2;
@@ -359,8 +396,9 @@ static scratch *scr(q35_model *m) {
     s.qk2 = xalloc((mx / QK_K + 16) * sizeof(block_q8_K) * 16);
     s.a_qs = xalloc(mx * 16); s.a_d = xalloc(mx / 32 * 4 * 16 + 64); s.a_s = xalloc(mx / 32 * 4 * 16 + 64);
     s.a_qs2 = xalloc(mx * 16); s.a_d2 = xalloc(mx / 32 * 4 * 16 + 64); s.a_s2 = xalloc(mx / 32 * 4 * 16 + 64);
-    init = 1;
-    return &s;
+    *sp = s;
+    *initp = 1;
+    return sp;
 }
 
 // y[rows] = W x, several matrices sharing one input, in one parallel region
@@ -442,7 +480,7 @@ static void delta_net(q35_model *m, const q35_layer *L, int ri, const float *xn,
         const float r = 1.0f / sqrtf(ss + c->eps);
         for (int i = 0; i < c->dk; i++) p[i] *= r;
     }
-    float *S = m->S + (size_t)ri * c->n_vh * c->dv * c->dk;
+    float *S = m->sp[ri];
     const float scale = 1.0f / sqrtf((float)c->dv);
     float *o = s->t1;   // qkv no longer needed
     const int D = c->dk;
@@ -499,16 +537,13 @@ static void softmax_inplace(float *x, int n) {
     const float r = 1.0f / s;
     for (int i = 0; i < n; i++) x[i] *= r;
 }
-static void attention(q35_model *m, const q35_layer *L, int ai, const float *xn, int pos, float *out, scratch *s) {
+// per head: [q | gate]; q and k get an RMS norm, then RoPE (NEOX) on the first n_rot dims.
+// q goes to qh_all; k and v are written to the cache at row widx.
+static void attn_prep(const q35_model *m, const q35_layer *L, const float *qg, float *k, const float *v, float *qh_all,
+                      int rpos, uint16_t *kc, uint16_t *vc, int widx) {
     const q35_cfg *c = &m->c;
-    const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD, gqa = NH / NKV;
-    qin q;
-    qin_init(&q, xn, c->n_embd, s->qk, s->a_qs, s->a_d, s->a_s);
-    float *qg = s->t1, *k = s->t2, *v = s->t3;
-    mv_job jobs[3] = {{&L->wq, qg}, {&L->wk, k}, {&L->wv, v}};
-    mv_multi(jobs, 3, &q);
-    // per head: [q | gate]; q and k get an RMS norm, then RoPE (NEOX) on the first n_rot dims
-    float *qh_all = s->big;
+    const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD;
+    const int pos = rpos;
     const int half = c->n_rot / 2;
     float cs[256], sn[256];
     for (int i = 0; i < half; i++) {
@@ -525,13 +560,18 @@ static void attention(q35_model *m, const q35_layer *L, int ai, const float *xn,
             p[i + half] = a * sn[i] + b * cs[i];
         }
     }
-    uint16_t *kc = m->kc + (size_t)ai * c->n_ctx * kvd, *vc = m->vc + (size_t)ai * c->n_ctx * kvd;
-    f32_to_f16(kc + (size_t)pos * kvd, k, kvd);
-    f32_to_f16(vc + (size_t)pos * kvd, v, kvd);
+    f32_to_f16(kc + (size_t)widx * kvd, k, kvd);
+    f32_to_f16(vc + (size_t)widx * kvd, v, kvd);
+}
+
+// attention of the heads in qh_all over cache rows [0, S), gated by sigmoid(gate) -> ao [NH * HD]
+static void attn_core(const q35_model *m, const uint16_t *kc, const uint16_t *vc, int S, const float *qh_all,
+                      const float *qg, float *ao, scratch *s) {
+    const q35_cfg *c = &m->c;
+    const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD, gqa = NH / NKV;
     const float scale = 1.0f / sqrtf((float)HD);
-    float *ao = s->t2 + kvd;   // after k: NH*HD floats fit (t2 has max(conv_dim, 2*NH*HD))
     // time-blocked: each K/V row is read once for all heads that share it
-    const int S = pos + 1, NBLK = S < 256 ? 1 : (S / 256 < 32 ? S / 256 : 32), bs = (S + NBLK - 1) / NBLK;
+    const int NBLK = S < 256 ? 1 : (S / 256 < 32 ? S / 256 : 32), bs = (S + NBLK - 1) / NBLK;
     static float *part;
     static size_t part_cap;
     if ((size_t)NBLK * NH * HD > part_cap) { free(part); part_cap = (size_t)32 * NH * HD; part = aligned_alloc(64, part_cap * 4); }
@@ -584,11 +624,28 @@ static void attention(q35_model *m, const q35_layer *L, int ai, const float *xn,
         const float *gate = qg + (size_t)h * 2 * HD + HD;
         for (int i = 0; i < HD; i++) o[i] *= sigmoidf(gate[i]);
     }
+}
+
+// one token: projections, write K/V at row widx (RoPE position rpos), attend over rows [0, S)
+static void attention(q35_model *m, const q35_layer *L, uint16_t *kc, uint16_t *vc, int widx, int rpos, int S,
+                      const float *xn, float *out, scratch *s) {
+    const q35_cfg *c = &m->c;
+    const int kvd = c->n_head_kv * c->hd;
+    qin q;
+    qin_init(&q, xn, c->n_embd, s->qk, s->a_qs, s->a_d, s->a_s);
+    float *qg = s->t1, *k = s->t2, *v = s->t3;
+    mv_job jobs[3] = {{&L->wq, qg}, {&L->wk, k}, {&L->wv, v}};
+    mv_multi(jobs, 3, &q);
+    attn_prep(m, L, qg, k, v, s->big, rpos, kc, vc, widx);
+    float *ao = s->t2 + kvd;   // after k: NH*HD floats fit (t2 has max(conv_dim, 2*NH*HD))
+    attn_core(m, kc, vc, S, s->big, qg, ao, s);
     qin q2;
-    qin_init(&q2, ao, NH * HD, s->qk2, s->a_qs2, s->a_d2, s->a_s2);
+    qin_init(&q2, ao, c->n_head * c->hd, s->qk2, s->a_qs2, s->a_d2, s->a_s2);
     mv_job j2 = {&L->wo, out};
     mv_multi(&j2, 1, &q2);
 }
+static uint16_t *kc_layer(q35_model *m, int ai) { return m->kc + (size_t)ai * m->c.n_ctx * m->c.n_head_kv * m->c.hd; }
+static uint16_t *vc_layer(q35_model *m, int ai) { return m->vc + (size_t)ai * m->c.n_ctx * m->c.n_head_kv * m->c.hd; }
 
 // ---------------- MoE: routed experts + shared expert ----------------
 static void moe(q35_model *m, int l, const float *xn, const float *xn_next, float *out, scratch *s) {
@@ -599,16 +656,26 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
     float w[16];
     double t0 = qnow();
     route(L, xn, c, K, sel, w);
-    if (m->prefetch_on && l > 0) {
+    if (m->prefetch_on && l > 0 && l < c->n_layer) {
         for (int j = 0; j < K; j++)
-            for (int q = 0; q < K; q++) m->pred_correct += m->pred[l * 16 + q] == sel[j];
+            for (int q = 0; q < (m->pred_n ? m->pred_n : K); q++) m->pred_correct += m->pred[l * 16 + q] == sel[j];
         m->pred_total += K;
     }
     experts_begin_layer(m->experts, l, sel, K);
     if (m->prefetch_on && xn_next && l + 1 < c->n_layer) {   // guess the next layer's experts
+        // QUARRY_PF_EXTRA: also prefetch the next few most likely ones (more SSD reads, fewer misses)
+        static int extra = -1;
+        if (extra < 0) extra = getenv("QUARRY_PF_EXTRA") ? atoi(getenv("QUARRY_PF_EXTRA")) : 0;
+        const int kp = K + extra > 16 ? 16 : K + extra;
         float pw[16];
-        route(&m->layers[l + 1], xn_next, c, K, m->pred + (l + 1) * 16, pw);
-        experts_prefetch(m->experts, l + 1, m->pred + (l + 1) * 16, K);
+        route(&m->layers[l + 1], xn_next, c, kp, m->pred + (l + 1) * 16, pw);
+        // QUARRY_PF_MIN: skip guesses whose (renormalized) router weight is below this
+        static float pmin = -1;
+        if (pmin < 0) pmin = getenv("QUARRY_PF_MIN") ? atof(getenv("QUARRY_PF_MIN")) : 0;
+        int np = kp;
+        if (pmin > 0) { np = 0; for (int j = 0; j < kp; j++) if (pw[j] >= pmin) np++; }   // sorted by weight
+        experts_prefetch(m->experts, l + 1, m->pred + (l + 1) * 16, np);
+        m->pred_n = kp;
     }
     q35_prof[2] += qnow() - t0;
 
@@ -678,6 +745,73 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
     q35_prof[3] += qnow() - t0;
 }
 
+// logits for T (1 or 2) normed hidden states. With the 4-bit copy: approximate logits for all
+// rows (each row read once for all tokens), then, if `exact`, the exact logits of the top 64
+// per token from the file's rows.
+static void out_logits(q35_model *m, const float *const *xn, int T, float *const *lg, int exact, scratch **ss) {
+    const q35_cfg *c = &m->c;
+    const int D = c->n_embd;
+    const qmat *O = &m->output;
+    qin q[2];
+    for (int t = 0; t < T; t++) qin_init(&q[t], xn[t], D, ss[t]->qk, ss[t]->a_qs, ss[t]->a_d, ss[t]->a_s);
+    if (!m->out4) {
+        for (int t = 0; t < T; t++) qin_need(&q[t], O->type);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < O->rows; r++)
+            for (int t = 0; t < T; t++) lg[t][r] = row_dot(O->type, O->data + (uint64_t)r * O->row_bytes, O->cols, &q[t]);
+        return;
+    }
+    // approximate logits from the 4-bit copy: w = d * (q - 8 + 0.5), x as u8 (+128) per 256
+    static uint8_t xu[2][8192] __attribute__((aligned(64)));
+    static float dx[2][32], xsum[2][128];
+    const int nb = D / 64, rb = m->out4_rb;
+    for (int t = 0; t < T; t++) {
+        quantize_row_u8(xn[t], xu[t], dx[t], D);
+        // sum over each 64-block of (xu - 128), for the +0.5 offset
+        for (int b = 0; b < nb; b++) { int sacc = 0; for (int i = 0; i < 64; i++) sacc += xu[t][b * 64 + i] - 128; xsum[t][b] = sacc * 0.5f * dx[t][b / 4]; }
+    }
+    const __m512i c128 = _mm512_set1_epi8((char)128), m4 = _mm512_set1_epi8(15), c8 = _mm512_set1_epi8(8);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < O->rows; r++) {
+        const uint8_t *row = m->out4 + (size_t)r * rb;
+        __m512 acc[2] = {_mm512_setzero_ps(), _mm512_setzero_ps()};
+        float off[2] = {0, 0};
+        for (int b = 0; b < nb; b++) {
+            float d; memcpy(&d, row + b * 36, 4);
+            const __m256i p = _mm256_loadu_si256((const __m256i *)(row + b * 36 + 4));
+            const __m512i pp = _mm512_inserti64x4(_mm512_castsi256_si512(p), _mm256_srli_epi16(p, 4), 1);
+            const __m512i qv = _mm512_sub_epi8(_mm512_and_si512(pp, m4), c8);
+            const __m512i corr = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, qv);
+            for (int t = 0; t < T; t++) {
+                const __m512i xv = _mm512_loadu_si512((const void *)(xu[t] + b * 64));
+                const __m512i dp = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, qv), corr);
+                acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), _mm512_set1_ps(d * dx[t][b / 4]), acc[t]);
+                off[t] += d * xsum[t][b];
+            }
+        }
+        for (int t = 0; t < T; t++) lg[t][r] = _mm512_reduce_add_ps(acc[t]) + off[t];
+    }
+    if (!exact) return;
+    // exact logits for the top candidates, rows read from the file
+    enum { NC = 64 };
+    static uint8_t *rows;
+    if (!rows) rows = malloc((size_t)NC * O->row_bytes);
+    for (int t = 0; t < T; t++) {
+        float *L = lg[t];
+        int cand[NC], nc = 0;
+        for (int r = 0; r < O->rows; r++) {
+            if (nc < NC || L[r] > L[cand[nc - 1]]) {
+                int j = nc < NC ? nc++ : NC - 1;
+                while (j > 0 && L[cand[j - 1]] < L[r]) { cand[j] = cand[j - 1]; j--; }
+                cand[j] = r;
+            }
+        }
+        for (int j = 0; j < nc; j++) read_at(&m->g, rows + (size_t)j * O->row_bytes, O->row_bytes, O->file_off + (uint64_t)cand[j] * O->row_bytes);
+        qin_need(&q[t], O->type);
+        for (int j = 0; j < nc; j++) L[cand[j]] = row_dot(O->type, rows + (size_t)j * O->row_bytes, O->cols, &q[t]);
+    }
+}
+
 float *q35_forward(q35_model *m, int token, int pos) {
     const q35_cfg *c = &m->c;
     scratch *s = scr(m);
@@ -688,7 +822,11 @@ float *q35_forward(q35_model *m, int token, int pos) {
         const q35_layer *L = &m->layers[l];
         rmsnorm(xn, x, L->attn_norm, D, c->eps);
         double t0 = qnow();
-        if (L->is_attn) { attention(m, L, m->attn_idx[l], xn, pos, res, s); q35_prof[1] += qnow() - t0; }
+        if (L->is_attn) {
+            const int ai = m->attn_idx[l];
+            attention(m, L, kc_layer(m, ai), vc_layer(m, ai), pos, pos, pos + 1, xn, res, s);
+            q35_prof[1] += qnow() - t0;
+        }
         else { delta_net(m, L, m->rec_idx[l], xn, res, s); q35_prof[0] += qnow() - t0; }
         for (int i = 0; i < D; i++) x[i] += res[i];
         rmsnorm(xn, x, L->post_norm, D, c->eps);
@@ -698,59 +836,363 @@ float *q35_forward(q35_model *m, int token, int pos) {
         for (int i = 0; i < D; i++) x[i] += res[i];
     }
     rmsnorm(xn, x, m->output_norm, D, c->eps);
+    memcpy(m->hlast, xn, D * 4);
     double t0 = qnow();
-    qin q;
-    qin_init(&q, xn, D, s->qk, s->a_qs, s->a_d, s->a_s);
-    if (!m->out4) {
-        mv_job j = {&m->output, m->logits};
-        mv_multi(&j, 1, &q);
-    } else {
-        // approximate logits from the 4-bit copy: w = d * (q - 8 + 0.5), x as u8 (+128) per 256
-        static uint8_t xu[8192] __attribute__((aligned(64)));
-        static float dx[32];
-        quantize_row_u8(xn, xu, dx, D);
-        const qmat *O = &m->output;
-        const int nb = D / 64, rb = m->out4_rb;
-        // sum over each 64-block of (xu - 128), for the +0.5 offset
-        float xs[128];
-        for (int b = 0; b < nb; b++) { int sacc = 0; for (int i = 0; i < 64; i++) sacc += xu[b * 64 + i] - 128; xs[b] = sacc * 0.5f * dx[b / 4]; }
-        const __m512i c128 = _mm512_set1_epi8((char)128), m4 = _mm512_set1_epi8(15), c8 = _mm512_set1_epi8(8);
-        #pragma omp parallel for schedule(static)
-        for (int r = 0; r < O->rows; r++) {
-            const uint8_t *row = m->out4 + (size_t)r * rb;
-            __m512 acc = _mm512_setzero_ps();
-            float off = 0;
-            for (int b = 0; b < nb; b++) {
-                float d; memcpy(&d, row + b * 36, 4);
-                const __m256i p = _mm256_loadu_si256((const __m256i *)(row + b * 36 + 4));
-                const __m512i pp = _mm512_inserti64x4(_mm512_castsi256_si512(p), _mm256_srli_epi16(p, 4), 1);
-                const __m512i qv = _mm512_sub_epi8(_mm512_and_si512(pp, m4), c8);
-                const __m512i xv = _mm512_loadu_si512((const void *)(xu + b * 64));
-                __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), xv, qv);
-                dp = _mm512_sub_epi32(dp, _mm512_dpbusd_epi32(_mm512_setzero_si512(), c128, qv));
-                acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), _mm512_set1_ps(d * dx[b / 4]), acc);
-                off += d * xs[b];
-            }
-            m->logits[r] = _mm512_reduce_add_ps(acc) + off;
-        }
-        // exact logits for the top candidates, rows read from the file
-        enum { NC = 64 };
-        int cand[NC], nc = 0;
-        for (int r = 0; r < O->rows; r++) {
-            if (nc < NC || m->logits[r] > m->logits[cand[nc - 1]]) {
-                int j = nc < NC ? nc++ : NC - 1;
-                while (j > 0 && m->logits[cand[j - 1]] < m->logits[r]) { cand[j] = cand[j - 1]; j--; }
-                cand[j] = r;
-            }
-        }
-        static uint8_t *rows;
-        if (!rows) rows = malloc((size_t)NC * O->row_bytes);
-        for (int j = 0; j < nc; j++) read_at(&m->g, rows + (size_t)j * O->row_bytes, O->row_bytes, O->file_off + (uint64_t)cand[j] * O->row_bytes);
-        qin_need(&q, O->type);
-        for (int j = 0; j < nc; j++) m->logits[cand[j]] = row_dot(O->type, rows + (size_t)j * O->row_bytes, O->cols, &q);
-    }
+    const float *xs[1] = {xn};
+    float *ls[1] = {m->logits};
+    scratch *ss[1] = {s};
+    out_logits(m, xs, 1, ls, 1, ss);
     q35_prof[5] += qnow() - t0;
     return m->logits;
+}
+
+
+// ======================= speculative decoding: MTP draft + 2-token verify =======================
+
+static inline void row_dot2(int type, const uint8_t *row, int n, const qin *q0, const qin *q1, float *r0, float *r1) {
+    switch (type) {
+    case GT_Q3_K: vec_dot2_q3_K_q8_K(n, (const block_q3_K *)row, q0->qk, q1->qk, r0, r1); return;
+    case GT_Q4_K: vec_dot2_q4_K_q8_K(n, (const block_q4_K *)row, q0->qk, q1->qk, r0, r1); return;
+    case GT_Q5_K: vec_dot2_q5_K_q8_K(n, (const block_q5_K *)row, q0->qk, q1->qk, r0, r1); return;
+    }
+    *r0 = row_dot(type, row, n, q0);
+    *r1 = row_dot(type, row, n, q1);
+}
+
+typedef struct { const qmat *W; float *y0, *y1; } mv2_job;
+// y0 = W x0, y1 = W x1: each weight row is read once for both tokens
+static void mv_multi2(const mv2_job *jobs, int nj, qin *q0, qin *q1) {
+    int start[8], total = 0;
+    for (int j = 0; j < nj; j++) { qin_need(q0, jobs[j].W->type); qin_need(q1, jobs[j].W->type); start[j] = total; total += jobs[j].W->rows; }
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < total; r++) {
+        int j = nj - 1;
+        while (r < start[j]) j--;
+        const qmat *W = jobs[j].W;
+        const int rr = r - start[j];
+        const uint8_t *row = W->data + (uint64_t)rr * W->row_bytes;
+        row_dot2(W->type, row, W->cols, q0, q1, &jobs[j].y0[rr], &jobs[j].y1[rr]);
+    }
+}
+
+// causal conv for one token (state cs: [n_conv - 1][conv_dim], oldest first), then SiLU
+static void conv_step(const q35_cfg *c, const q35_layer *L, float *cs, const float *qkv, float *cv) {
+    const int CD = c->conv_dim, nc = c->n_conv;
+    for (int ch = 0; ch < CD; ch += 16) {
+        const __m512 cur = _mm512_loadu_ps(qkv + ch);
+        __m512 acc = _mm512_mul_ps(_mm512_loadu_ps(L->conv_wt + (size_t)(nc - 1) * CD + ch), cur);
+        for (int k = 0; k < nc - 1; k++)
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(L->conv_wt + (size_t)k * CD + ch), _mm512_loadu_ps(cs + (size_t)k * CD + ch), acc);
+        for (int k = 0; k < nc - 2; k++) _mm512_storeu_ps(cs + (size_t)k * CD + ch, _mm512_loadu_ps(cs + (size_t)(k + 1) * CD + ch));
+        _mm512_storeu_ps(cs + (size_t)(nc - 2) * CD + ch, cur);
+        _mm512_storeu_ps(cv + ch, silu_ps(acc));
+    }
+    for (int h = 0; h < 2 * c->n_kh; h++) {   // L2 norm of the q and k heads
+        float *p = cv + (size_t)h * c->dk;
+        const float r = 1.0f / sqrtf(dotf(p, p, c->dk) + c->eps);
+        for (int i = 0; i < c->dk; i++) p[i] *= r;
+    }
+}
+
+static void delta_net2(q35_model *m, const q35_layer *L, int ri, const float *xn0, const float *xn1,
+                       float *out0, float *out1, scratch *s0, scratch *s1) {
+    const q35_cfg *c = &m->c;
+    const int NV = c->n_vh, DK = c->dk, DV = c->dv, CD = c->conv_dim;
+    qin q0, q1;
+    qin_init(&q0, xn0, c->n_embd, s0->qk, s0->a_qs, s0->a_d, s0->a_s);
+    qin_init(&q1, xn1, c->n_embd, s1->qk, s1->a_qs, s1->a_d, s1->a_s);
+    double td = qnow();
+    mv2_job jobs[4] = {{&L->wqkv, s0->t1, s1->t1}, {&L->wz, s0->t2, s1->t2},
+                       {&L->walpha, s0->t3, s1->t3}, {&L->wbeta, s0->t3 + NV, s1->t3 + NV}};
+    mv_multi2(jobs, 4, &q0, &q1);
+    q35_prof[6] += qnow() - td; td = qnow();
+    float *cs = m->conv + (size_t)ri * (c->n_conv - 1) * CD;
+    conv_step(c, L, cs, s0->t1, s0->big);
+    memcpy(m->conv_bk + (size_t)ri * (c->n_conv - 1) * CD, cs, (size_t)(c->n_conv - 1) * CD * 4);   // for rollback
+    conv_step(c, L, cs, s1->t1, s1->big);
+    const float *cv[2] = {s0->big, s1->big}, *ab[2] = {s0->t3, s1->t3}, *z[2] = {s0->t2, s1->t2};
+    float *o[2] = {s0->t1, s1->t1};
+    float *S = m->sp[ri], *S2 = m->sp_alt[ri];
+    const float scale = 1.0f / sqrtf((float)DV);
+    const int NR = DK / 16;
+    #pragma omp parallel for schedule(static)
+    for (int h = 0; h < NV; h++) {
+        float g[2], beta[2];
+        const float *kh[2], *qh[2], *vh[2];
+        for (int t = 0; t < 2; t++) {
+            g[t] = expf(softplusf(ab[t][h] + L->dt_bias[h]) * L->ssm_a[h]);
+            beta[t] = sigmoidf(ab[t][NV + h]);
+            kh[t] = cv[t] + c->key_dim + (size_t)(h % c->n_kh) * DK;
+            qh[t] = cv[t] + (size_t)(h % c->n_kh) * DK;
+            vh[t] = cv[t] + 2 * c->key_dim + (size_t)h * DV;
+        }
+        float *M = S + (size_t)h * DV * DK, *M2 = S2 + (size_t)h * DV * DK;
+        for (int j = 0; j < DV; j++) {
+            __m512 r[16];
+            float *row = M + (size_t)j * DK;
+            for (int i = 0; i < NR; i++) r[i] = _mm512_loadu_ps(row + 16 * i);
+            for (int t = 0; t < 2; t++) {
+                const __m512 gv = _mm512_set1_ps(g[t]);
+                __m512 acc = _mm512_setzero_ps();
+                for (int i = 0; i < NR; i++) { r[i] = _mm512_mul_ps(r[i], gv); acc = _mm512_fmadd_ps(r[i], _mm512_loadu_ps(kh[t] + 16 * i), acc); }
+                const __m512 dv = _mm512_set1_ps((vh[t][j] - _mm512_reduce_add_ps(acc)) * beta[t]);
+                __m512 oa = _mm512_setzero_ps();
+                for (int i = 0; i < NR; i++) {
+                    r[i] = _mm512_fmadd_ps(dv, _mm512_loadu_ps(kh[t] + 16 * i), r[i]);
+                    oa = _mm512_fmadd_ps(r[i], _mm512_loadu_ps(qh[t] + 16 * i), oa);
+                }
+                float *dst = t == 0 ? row : M2 + (size_t)j * DK;   // state after token 0 in place, after token 1 in the alternate buffer
+                for (int i = 0; i < NR; i++) _mm512_storeu_ps(dst + 16 * i, r[i]);
+                o[t][(size_t)h * DV + j] = _mm512_reduce_add_ps(oa) * scale;
+            }
+        }
+        for (int t = 0; t < 2; t++) {
+            float *oh = o[t] + (size_t)h * DV;
+            const float *zh = z[t] + (size_t)h * DV;
+            const __m512 rv = _mm512_set1_ps(1.0f / sqrtf(dotf(oh, oh, DV) / DV + c->eps));
+            for (int j = 0; j < DV; j += 16)
+                _mm512_storeu_ps(oh + j, _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(oh + j), rv),
+                                 _mm512_loadu_ps(L->ssm_norm + j)), silu_ps(_mm512_loadu_ps(zh + j))));
+        }
+    }
+    q35_prof[7] += qnow() - td; td = qnow();
+    qin p0, p1;
+    qin_init(&p0, o[0], c->value_dim, s0->qk2, s0->a_qs2, s0->a_d2, s0->a_s2);
+    qin_init(&p1, o[1], c->value_dim, s1->qk2, s1->a_qs2, s1->a_d2, s1->a_s2);
+    mv2_job j2 = {&L->wout, out0, out1};
+    mv_multi2(&j2, 1, &p0, &p1);
+    q35_prof[6] += qnow() - td;
+}
+
+static void attention2(q35_model *m, const q35_layer *L, int ai, const float *xn0, const float *xn1, int pos,
+                       float *out0, float *out1, scratch *s0, scratch *s1) {
+    const q35_cfg *c = &m->c;
+    const int kvd = c->n_head_kv * c->hd;
+    qin q0, q1;
+    qin_init(&q0, xn0, c->n_embd, s0->qk, s0->a_qs, s0->a_d, s0->a_s);
+    qin_init(&q1, xn1, c->n_embd, s1->qk, s1->a_qs, s1->a_d, s1->a_s);
+    mv2_job jobs[3] = {{&L->wq, s0->t1, s1->t1}, {&L->wk, s0->t2, s1->t2}, {&L->wv, s0->t3, s1->t3}};
+    mv_multi2(jobs, 3, &q0, &q1);
+    uint16_t *kc = kc_layer(m, ai), *vc = vc_layer(m, ai);
+    scratch *ss[2] = {s0, s1};
+    for (int t = 0; t < 2; t++) attn_prep(m, L, ss[t]->t1, ss[t]->t2, ss[t]->t3, ss[t]->big, pos + t, kc, vc, pos + t);
+    for (int t = 0; t < 2; t++) attn_core(m, kc, vc, pos + t + 1, ss[t]->big, ss[t]->t1, ss[t]->t2 + kvd, s0);
+    qin p0, p1;
+    qin_init(&p0, s0->t2 + kvd, c->n_head * c->hd, s0->qk2, s0->a_qs2, s0->a_d2, s0->a_s2);
+    qin_init(&p1, s1->t2 + kvd, c->n_head * c->hd, s1->qk2, s1->a_qs2, s1->a_d2, s1->a_s2);
+    mv2_job j2 = {&L->wo, out0, out1};
+    mv_multi2(&j2, 1, &p0, &p1);
+}
+
+// routed experts (union of both tokens' choices) + shared expert, for two tokens
+static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float *out0, float *out1, scratch *s0, scratch *s1) {
+    const q35_cfg *c = &m->c;
+    const q35_layer *L = &m->layers[l];
+    const int K = c->n_used, F = c->n_ff, D = c->n_embd;
+    int sel[2][16], U[32], nu = 0;
+    float w[2][16], uw[32][2];
+    double t0 = qnow();
+    route(L, xn0, c, K, sel[0], w[0]);
+    route(L, xn1, c, K, sel[1], w[1]);
+    for (int t = 0; t < 2; t++)
+        for (int j = 0; j < K; j++) {
+            int u = 0;
+            while (u < nu && U[u] != sel[t][j]) u++;
+            if (u == nu) { U[nu] = sel[t][j]; uw[nu][0] = uw[nu][1] = 0; nu++; }
+            uw[u][t] = w[t][j];
+        }
+    if (m->prefetch_on && l > 0 && l < c->n_layer) {
+        for (int j = 0; j < K; j++)
+            for (int q = 0; q < (m->pred_n ? m->pred_n : K); q++) m->pred_correct += m->pred[l * 16 + q] == sel[0][j];
+        m->pred_total += K;
+    }
+    experts_begin_layer(m->experts, l, U, nu);
+    if (m->prefetch_on && l + 1 < c->n_layer) {   // next layer: union of both tokens' guesses
+        int p[2][16], pu[16], npu = 0;
+        float pw[16];
+        route(&m->layers[l + 1], xn0, c, K, p[0], pw);
+        route(&m->layers[l + 1], xn1, c, K, p[1], pw);
+        for (int j = 0; j < K; j++)
+            for (int t = 0; t < 2; t++) {   // interleaved: most likely first
+                int u = 0;
+                while (u < npu && pu[u] != p[t][j]) u++;
+                if (u == npu && npu < 16) pu[npu++] = p[t][j];
+            }
+        memcpy(m->pred + (l + 1) * 16, pu, sizeof pu);
+        m->pred_n = npu;
+        experts_prefetch(m->experts, l + 1, pu, npu);
+    }
+    q35_prof[2] += qnow() - t0;
+
+    t0 = qnow();
+    qin q0, q1;
+    qin_init(&q0, xn0, D, s0->qk, s0->a_qs, s0->a_d, s0->a_s);
+    qin_init(&q1, xn1, D, s1->qk, s1->a_qs, s1->a_d, s1->a_s);
+    mv2_job jobs[2] = {{&L->sh_gate, s0->t1, s1->t1}, {&L->sh_up, s0->t2, s1->t2}};
+    mv_multi2(jobs, 2, &q0, &q1);
+    silu_mul(s0->t1, s0->t2, c->n_ff_sh);
+    silu_mul(s1->t1, s1->t2, c->n_ff_sh);
+    qin p0, p1;
+    qin_init(&p0, s0->t1, c->n_ff_sh, s0->qk2, s0->a_qs2, s0->a_d2, s0->a_s2);
+    qin_init(&p1, s1->t1, c->n_ff_sh, s1->qk2, s1->a_qs2, s1->a_d2, s1->a_s2);
+    mv2_job jd = {&L->sh_down, out0, out1};
+    mv_multi2(&jd, 1, &p0, &p1);
+    const float g0 = sigmoidf(dotf(L->shexp_gate, xn0, D)), g1 = sigmoidf(dotf(L->shexp_gate, xn1, D));
+    for (int i = 0; i < D; i++) { out0[i] *= g0; out1[i] *= g1; }
+    q35_prof[4] += qnow() - t0;
+
+    t0 = qnow();
+    qin *qq[2] = {&q0, &q1};
+    for (int t = 0; t < 2; t++) { qin_need(qq[t], L->gate_exps.type); qin_need(qq[t], L->up_exps.type); }
+    const int gt = L->gate_exps.type, ut = L->up_exps.type, dt = L->down_exps.type;
+    const uint64_t grb = L->gate_exps.row_bytes, urb = L->up_exps.row_bytes, drb = L->down_exps.row_bytes;
+    float *outs[2] = {out0, out1};
+    int done[32] = {0};
+    for (int n_done = 0; n_done < nu;) {
+        int bl[32], nb = 0;
+        for (int k = 0; k < nu; k++) if (!done[k] && experts_ready(m->experts, l, U[k])) bl[nb++] = k;
+        if (!nb) {
+            int rest[32], nr = 0;
+            for (int k = 0; k < nu; k++) if (!done[k]) rest[nr++] = U[k];
+            experts_wait_any(m->experts, l, rest, nr);
+            continue;
+        }
+        n_done += nb;
+        // (expert, token) pairs
+        int pe[32], pt[32], np = 0;
+        const uint8_t *gw[32], *uwp[32], *dw[32];
+        for (int j = 0; j < nb; j++) {
+            const uint8_t *a, *b, *d;
+            experts_get(m->experts, l, U[bl[j]], &a, &b, &d);
+            for (int t = 0; t < 2; t++)
+                if (uw[bl[j]][t] > 0 && np < 16) { pe[np] = bl[j]; pt[np] = t; gw[np] = a; uwp[np] = b; dw[np] = d; np++; }
+        }
+        // entries: one per expert, with its pair index for each token (-1 if unused); an expert
+        // used by both tokens is unpacked once per row (row_dot2)
+        int ep[16][2], ne = 0;
+        for (int j = 0; j < np; j++) {
+            if (ne && pe[ep[ne - 1][0] >= 0 ? ep[ne - 1][0] : ep[ne - 1][1]] == pe[j]) ep[ne - 1][pt[j]] = j;
+            else { ep[ne][0] = ep[ne][1] = -1; ep[ne][pt[j]] = j; ne++; }
+        }
+        float *G = s0->eg, *H = s0->eh;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < ne * 2 * F; r++) {
+            const int e = r / (2 * F), rr = r % (2 * F), a = ep[e][0], b = ep[e][1], j = a >= 0 ? a : b;
+            const int up = rr >= F, ri = up ? rr - F : rr, ty = up ? ut : gt;
+            const uint8_t *row = (up ? uwp[j] + (uint64_t)ri * urb : gw[j] + (uint64_t)ri * grb);
+            float *Y = up ? H : G;
+            if (a >= 0 && b >= 0) row_dot2(ty, row, D, qq[0], qq[1], &Y[a * F + ri], &Y[b * F + ri]);
+            else Y[j * F + ri] = row_dot(ty, row, D, qq[pt[j]]);
+        }
+        qin hq[16];
+        for (int j = 0; j < np; j++) {
+            float *gg = G + j * F;
+            silu_mul(gg, H + j * F, F);
+            const int nbk = (F + QK_K - 1) / QK_K + 1;
+            qin_init(&hq[j], gg, F, s0->qk2 + j * nbk, s0->a_qs2 + j * F, s0->a_d2 + j * (F / 32 + 1), s0->a_s2 + j * (F / 32 + 1));
+            qin_need(&hq[j], dt);
+        }
+        float *O = s0->eo;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < ne * D; r++) {
+            const int e = r / D, rr = r % D, a = ep[e][0], b = ep[e][1], j = a >= 0 ? a : b;
+            const uint8_t *row = dw[j] + (uint64_t)rr * drb;
+            if (a >= 0 && b >= 0) row_dot2(dt, row, F, &hq[a], &hq[b], &O[a * D + rr], &O[b * D + rr]);
+            else O[j * D + rr] = row_dot(dt, row, F, &hq[j]);
+        }
+        for (int j = 0; j < np; j++) {
+            const float wj = uw[pe[j]][pt[j]];
+            float *o = outs[pt[j]];
+            for (int i = 0; i < D; i++) o[i] += wj * O[j * D + i];
+        }
+        for (int j = 0; j < nb; j++) { experts_release(m->experts, l, U[bl[j]]); done[bl[j]] = 1; }
+    }
+    q35_prof[3] += qnow() - t0;
+}
+
+void q35_forward2(q35_model *m, int tok0, int tok1, int pos) {
+    const q35_cfg *c = &m->c;
+    scratch *s0 = scr(m), *s1 = scr1(m);
+    const int D = c->n_embd;
+    float *x0 = s0->x, *x1 = s1->x, *n0 = s0->xn, *n1 = s1->xn, *r0 = s0->moe, *r1 = s1->moe;
+    embed(m, tok0, x0);
+    embed(m, tok1, x1);
+    for (int l = 0; l < c->n_layer; l++) {
+        const q35_layer *L = &m->layers[l];
+        rmsnorm(n0, x0, L->attn_norm, D, c->eps);
+        rmsnorm(n1, x1, L->attn_norm, D, c->eps);
+        double t0 = qnow();
+        if (L->is_attn) { attention2(m, L, m->attn_idx[l], n0, n1, pos, r0, r1, s0, s1); q35_prof[1] += qnow() - t0; }
+        else { delta_net2(m, L, m->rec_idx[l], n0, n1, r0, r1, s0, s1); q35_prof[0] += qnow() - t0; }
+        for (int i = 0; i < D; i++) { x0[i] += r0[i]; x1[i] += r1[i]; }
+        rmsnorm(n0, x0, L->post_norm, D, c->eps);
+        rmsnorm(n1, x1, L->post_norm, D, c->eps);
+        moe2(m, l, n0, n1, r0, r1, s0, s1);
+        for (int i = 0; i < D; i++) { x0[i] += r0[i]; x1[i] += r1[i]; }
+    }
+    rmsnorm(m->h2[0], x0, m->output_norm, D, c->eps);
+    rmsnorm(m->h2[1], x1, m->output_norm, D, c->eps);
+    double t0 = qnow();
+    const float *xs[2] = {m->h2[0], m->h2[1]};
+    scratch *ss[2] = {s0, s1};
+    out_logits(m, xs, 2, m->logits2, 1, ss);
+    q35_prof[5] += qnow() - t0;
+}
+
+void q35_commit(q35_model *m, int keep_both) {
+    const q35_cfg *c = &m->c;
+    m->spec_steps++;
+    if (keep_both) {
+        m->spec_accepted++;
+        for (int r = 0; r < m->n_rec; r++) { float *t = m->sp[r]; m->sp[r] = m->sp_alt[r]; m->sp_alt[r] = t; }
+        memcpy(m->hlast, m->h2[1], c->n_embd * 4);
+    } else {
+        memcpy(m->conv, m->conv_bk, (size_t)m->n_rec * (c->n_conv - 1) * c->conv_dim * 4);
+        memcpy(m->hlast, m->h2[0], c->n_embd * 4);
+    }
+}
+
+// MTP: x = eh_proj([enorm(embed(tok)); hnorm(hlast)]), one attention + MoE block, then the LM head
+int q35_draft(q35_model *m, int tok, int pos) {
+    const q35_cfg *c = &m->c;
+    scratch *s = scr(m);
+    const int D = c->n_embd;
+    const q35_layer *L = &m->layers[c->n_layer];
+    float *cat = s->big, *x = s->x, *xn = s->xn, *res = s->moe;
+    double t0 = qnow();
+    embed(m, tok, s->t3);
+    rmsnorm(cat, s->t3, m->mtp_enorm, D, c->eps);
+    rmsnorm(cat + D, m->hlast, m->mtp_hnorm, D, c->eps);
+    qin q;
+    qin_init(&q, cat, 2 * D, s->qk, s->a_qs, s->a_d, s->a_s);
+    mv_job j = {&m->eh_proj, x};
+    mv_multi(&j, 1, &q);
+    if (m->mtp_n >= c->n_ctx) m->mtp_n = 0;
+    rmsnorm(xn, x, L->attn_norm, D, c->eps);
+    attention(m, L, m->mtp_kc, m->mtp_vc, m->mtp_n, pos, m->mtp_n + 1, xn, res, s);
+    m->mtp_n++;
+    for (int i = 0; i < D; i++) x[i] += res[i];
+    rmsnorm(xn, x, L->post_norm, D, c->eps);
+    {   // QUARRY_MTP_K: experts per token in the draft layer (its Q8_0 experts are big; fewer
+        // costs a little acceptance, never correctness)
+        static int mk = -1;
+        if (mk < 0) mk = getenv("QUARRY_MTP_K") ? atoi(getenv("QUARRY_MTP_K")) : 0;
+        q35_cfg *cw = &m->c;
+        const int keep = cw->n_used;
+        if (mk > 0 && mk < keep) cw->n_used = mk;
+        moe(m, c->n_layer, xn, NULL, res, s);
+        cw->n_used = keep;
+    }
+    for (int i = 0; i < D; i++) x[i] += res[i];
+    rmsnorm(xn, x, m->mtp_head_norm, D, c->eps);
+    const float *xs[1] = {xn};
+    float *ls[1] = {m->logits2[1]};
+    scratch *ss[1] = {s};
+    out_logits(m, xs, 1, ls, 0, ss);
+    int best = 0;
+    for (int i = 1; i < c->n_vocab; i++) if (ls[0][i] > ls[0][best]) best = i;
+    m->draft_seconds += qnow() - t0;
+    return best;
 }
 
 // ======================= batched prompt processing =======================
@@ -1010,7 +1452,7 @@ static void pf_delta_net(q35_model *m, const q35_layer *L, int ri, q35_pfbuf *b,
         }
     q35_prof[7] += qnow() - tp; tp = qnow();
     // recurrence: each head runs through the whole chunk with its state in cache
-    float *S = m->S + (size_t)ri * NV * c->dv * DK;
+    float *S = m->sp[ri];
     const float scale = 1.0f / sqrtf((float)c->dv);
     #pragma omp parallel for schedule(dynamic, 1)
     for (int h = 0; h < NV; h++) {

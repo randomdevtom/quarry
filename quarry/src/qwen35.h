@@ -52,12 +52,26 @@ typedef struct q35_model {
     int *attn_idx, *rec_idx, n_attn, n_rec;
     uint16_t *kc, *vc;              // [n_attn][n_ctx][n_head_kv * hd]
     float *S;                       // [n_rec][n_vh][dv][dk]  (row j = column j of the state)
+    float *S2;                      // second state buffer (2-token verify writes the 2nd token's state here)
+    float **sp, **sp_alt;           // [n_rec] current state / alternate buffer per layer
+    float *conv_bk;                 // conv state after the 1st token of a 2-token step
     float *conv;                    // [n_rec][n_conv - 1][conv_dim]
     float *logits;
     uint64_t expert_bytes_read, expert_loads;
     int prefetch_on;
     uint64_t pred_total, pred_correct;
-    int *pred;                      // [n_layer][n_used] guesses for the next layer
+    // multi-token prediction (MTP) layer: drafts the next token for speculative decoding
+    int has_mtp;                    // layers[n_layer] is the MTP block
+    qmat eh_proj;
+    float *mtp_enorm, *mtp_hnorm, *mtp_head_norm;
+    uint16_t *mtp_kc, *mtp_vc;      // its own KV, one row per draft call
+    int mtp_n;
+    float *hlast;                   // final normed hidden of the last forward (feeds the MTP)
+    float *h2[2], *logits2[2];      // 2-token verify outputs
+    uint64_t spec_steps, spec_accepted;
+    double draft_seconds;
+    int *pred;                      // [n_layer][16] guesses for the next layer
+    int pred_n;                     // guesses per layer
 } q35_model;
 
 int q35_detect(const char *path);
@@ -69,4 +83,11 @@ float *q35_prefill(q35_model *m, const int *tokens, int n, int pos0);
 size_t q35_state_bytes(const q35_model *m);
 void q35_state_save(const q35_model *m, void *dst);
 void q35_state_load(q35_model *m, const void *src);
+void q35_state_reset(q35_model *m);
+// speculative decoding: draft the token after `tok` (at `pos`) with the MTP layer, from hlast
+int q35_draft(q35_model *m, int tok, int pos);
+// run tok0 at pos and tok1 at pos + 1 together; logits2[0], logits2[1] and h2[] are set.
+// Then q35_commit(m, 1) keeps both tokens, q35_commit(m, 0) keeps only tok0.
+void q35_forward2(q35_model *m, int tok0, int tok1, int pos);
+void q35_commit(q35_model *m, int keep_both);
 extern double q35_prof[8], q35_mp[8];
