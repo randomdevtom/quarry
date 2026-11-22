@@ -57,9 +57,9 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     e->vocab = llama_model_get_vocab(e->tok_model);
     e->q35 = q35_detect(path);
     e->ink = !e->q35 && ink_detect(path);
-    // Qwen3-Coder (qwen3moe) default: 6 of its 8 routed experts per token. Same HumanEval
-    // score in our tests, ~10-25% faster. `--experts 8` (or QUARRY_TOPK=8) restores the exact model.
-    if (!e->q35 && !e->ink && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
+    // Qwen MoE default: 6 of the 8 routed experts per token. Same HumanEval score in our tests
+    // (Qwen3-Coder 19/21, Qwen3.8 distill 20/21), 10-25% faster. `--experts 8` restores the exact model.
+    if (!e->ink && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (e->q35) {
         if (q35_load(&e->qm, path, n_ctx)) return -1;
         e->snap = malloc(q35_state_bytes(&e->qm));
@@ -285,6 +285,7 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         gen_stats st = {0};
         acc_t acc = {reply, 0};
         e->show_thinking = 1;
+        memset(q35_prof, 0, sizeof q35_prof);
         eng_generate(e, p, n, temp, 0.9f, emit_cli, &acc, &st);
         e->show_thinking = 0;
         fprintf(stderr, "\n[%d prompt tokens %.1fs | %d tokens %.2f tok/s]\n", st.prompt_tokens, st.t_prompt,
@@ -299,6 +300,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
                                 100.0 * e->im.pred_correct / (e->im.pred_total + 1e-9),
                                 100.0 * e->im.pred2_correct / (e->im.pred_total + 1e-9), ink_prof[0], ink_prof[1], ink_prof[2], ink_prof[3]);
             if (e->ink && e->im.skipped) fprintf(stderr, " | skipped %llu experts", (unsigned long long)e->im.skipped);
+            if (e->q35) fprintf(stderr, " | prediction %.0f%% | delta-net %.1fs attn %.1fs route %.1fs experts %.1fs shared %.1fs output %.1fs (delta-net proj %.1fs, conv+recur %.1fs)",
+                                100.0 * e->qm.pred_correct / (e->qm.pred_total + 1e-9), q35_prof[0], q35_prof[1], q35_prof[2], q35_prof[3], q35_prof[4], q35_prof[5], q35_prof[6], q35_prof[7]);
             if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);
             fprintf(stderr, "]\n");
         }

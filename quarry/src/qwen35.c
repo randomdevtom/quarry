@@ -100,7 +100,7 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     if (getenv("QUARRY_TOPK") && atoi(getenv("QUARRY_TOPK")) > 0 && atoi(getenv("QUARRY_TOPK")) < c->n_used) c->n_used = atoi(getenv("QUARRY_TOPK"));
     const qg_tensor *emb = find(g, "token_embd.weight", 1);
     c->n_vocab = emb->ne[1];
-    if (c->dk != c->dv || c->hd > 512 || c->n_used > 16 || c->n_conv > 8 || c->conv_dim % 16 || c->dv % 16) { fprintf(stderr, "qwen35: unsupported shape\n"); return -1; }
+    if (c->dk != c->dv || c->hd > 512 || c->hd % 128 || c->n_head / c->n_head_kv > 8 || c->n_used > 16 || c->n_conv > 8 || c->conv_dim % 16 || c->dv % 16) { fprintf(stderr, "qwen35: unsupported shape\n"); return -1; }
 
     m->tok_embd = mat(g, "token_embd.weight", 0, 1);
     m->output_norm = f32(g, "output_norm.weight");
@@ -375,8 +375,10 @@ static void delta_net(q35_model *m, const q35_layer *L, int ri, const float *xn,
     qin q;
     qin_init(&q, xn, c->n_embd, s->qk, s->a_qs, s->a_d, s->a_s);
     float *qkv = s->t1, *z = s->t2, *ab = s->t3;     // ab: alpha [n_vh] then beta [n_vh]
+    double td = qnow();
     mv_job jobs[4] = {{&L->wqkv, qkv}, {&L->wz, z}, {&L->walpha, ab}, {&L->wbeta, ab + c->n_vh}};
     mv_multi(jobs, 4, &q);
+    q35_prof[6] += qnow() - td; td = qnow();
     // short causal conv over [3 previous inputs, current], then SiLU
     float *cs = m->conv + (size_t)ri * (c->n_conv - 1) * c->conv_dim;   // [tap][channel], oldest first
     float *cv = s->big;
@@ -438,10 +440,12 @@ static void delta_net(q35_model *m, const q35_layer *L, int ri, const float *xn,
         const float r = 1.0f / sqrtf(ss / c->dv + c->eps);
         for (int j = 0; j < c->dv; j++) oh[j] = oh[j] * r * L->ssm_norm[j] * siluf(zh[j]);
     }
+    q35_prof[7] += qnow() - td; td = qnow();
     qin q2;
     qin_init(&q2, o, c->value_dim, s->qk2, s->a_qs2, s->a_d2, s->a_s2);
     mv_job j2 = {&L->wout, out};
     mv_multi(&j2, 1, &q2);
+    q35_prof[6] += qnow() - td;
 }
 
 // ---------------- gated full attention (one token) ----------------
@@ -484,23 +488,55 @@ static void attention(q35_model *m, const q35_layer *L, int ai, const float *xn,
     f32_to_f16(vc + (size_t)pos * kvd, v, kvd);
     const float scale = 1.0f / sqrtf((float)HD);
     float *ao = s->t2 + kvd;   // after k: NH*HD floats fit (t2 has max(conv_dim, 2*NH*HD))
+    // time-blocked: each K/V row is read once for all heads that share it
+    const int S = pos + 1, NBLK = S < 256 ? 1 : (S / 256 < 32 ? S / 256 : 32), bs = (S + NBLK - 1) / NBLK;
+    static float *part;
+    static size_t part_cap;
+    if ((size_t)NBLK * NH * HD > part_cap) { free(part); part_cap = (size_t)32 * NH * HD; part = aligned_alloc(64, part_cap * 4); }
+    #pragma omp parallel for schedule(static)
+    for (int bk = 0; bk < NBLK; bk++) {
+        const int t0 = bk * bs, t1 = t0 + bs < S ? t0 + bs : S;
+        for (int t = t0; t < t1; t++)
+            for (int kvh = 0; kvh < NKV; kvh++) {
+                const uint16_t *kt = kc + (size_t)t * kvd + kvh * HD;
+                for (int g = 0; g < gqa; g++) {
+                    const int h = kvh * gqa + g;
+                    const float *qh = qh_all + (size_t)h * HD;
+                    __m512 a0 = _mm512_setzero_ps(), a1 = a0;
+                    for (int i = 0; i < HD; i += 32) {
+                        a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), f16x16(kt + i), a0);
+                        a1 = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i + 16), f16x16(kt + i + 16), a1);
+                    }
+                    s->att[(size_t)h * c->n_ctx + t] = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) * scale;
+                }
+            }
+    }
+    #pragma omp parallel for schedule(static)
+    for (int h = 0; h < NH; h++) softmax_inplace(s->att + (size_t)h * c->n_ctx, S);
+    #pragma omp parallel for schedule(static)
+    for (int bk = 0; bk < NBLK; bk++) {
+        const int t0 = bk * bs, t1 = t0 + bs < S ? t0 + bs : S;
+        float *pp = part + (size_t)bk * NH * HD;
+        memset(pp, 0, (size_t)NH * HD * 4);
+        for (int t = t0; t < t1; t++)
+            for (int kvh = 0; kvh < NKV; kvh++) {
+                const uint16_t *vt = vc + (size_t)t * kvd + kvh * HD;
+                for (int i = 0; i < HD; i += 16) {
+                    const __m512 v = f16x16(vt + i);
+                    for (int g = 0; g < gqa; g++) {
+                        const int h = kvh * gqa + g;
+                        float *o = pp + (size_t)h * HD + i;
+                        _mm512_storeu_ps(o, _mm512_fmadd_ps(_mm512_set1_ps(s->att[(size_t)h * c->n_ctx + t]), v, _mm512_loadu_ps(o)));
+                    }
+                }
+            }
+    }
     #pragma omp parallel for schedule(static)
     for (int h = 0; h < NH; h++) {
-        const float *qh = qh_all + (size_t)h * HD;
-        float *att = s->att + (size_t)h * c->n_ctx;
-        const int kvh = h / gqa;
-        for (int t = 0; t <= pos; t++) {
-            const uint16_t *kt = kc + (size_t)t * kvd + kvh * HD;
-            __m512 a0 = _mm512_setzero_ps();
-            for (int i = 0; i < HD; i += 16) a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), f16x16(kt + i), a0);
-            att[t] = _mm512_reduce_add_ps(a0) * scale;
-        }
-        softmax_inplace(att, pos + 1);
         float *o = ao + (size_t)h * HD;
         for (int i = 0; i < HD; i += 16) {
             __m512 acc = _mm512_setzero_ps();
-            for (int t = 0; t <= pos; t++)
-                acc = _mm512_fmadd_ps(_mm512_set1_ps(att[t]), f16x16(vc + (size_t)t * kvd + kvh * HD + i), acc);
+            for (int bk = 0; bk < NBLK; bk++) acc = _mm512_add_ps(acc, _mm512_loadu_ps(part + ((size_t)bk * NH + h) * HD + i));
             _mm512_storeu_ps(o + i, acc);
         }
         const float *gate = qg + (size_t)h * 2 * HD + HD;
@@ -962,35 +998,79 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
         f32_to_f16(vc + (size_t)pos * kvd, V + (size_t)t * kvd, kvd);
     }
     const float scale = 1.0f / sqrtf((float)HD);
-    const int S = pos0 + T;
+    // work item: QB query tokens x the gqa heads sharing one KV head. K/V rows are converted
+    // to f32 a block at a time and reused by all of the item's queries.
+    enum { QB = 8, KB = 64 };
+    const int NQ = QB * gqa, nqb = (T + QB - 1) / QB, S_all = pos0 + T;
     #pragma omp parallel
     {
-        float *att = malloc((size_t)S * 4);
+        float *att = aligned_alloc(64, ((size_t)NQ * S_all * 4 + 63) / 64 * 64);
+        float *Kf = aligned_alloc(64, (size_t)KB * HD * 4), *Vf = aligned_alloc(64, (size_t)KB * HD * 4);
+        float *acc = aligned_alloc(64, (size_t)NQ * HD * 4);
         #pragma omp for schedule(dynamic, 1)
-        for (int item = 0; item < T * NH; item++) {
-            const int t = T - 1 - item / NH, h = item % NH, pos = pos0 + t, kvh = h / gqa;   // longest first
-            const float *qh = QG + (size_t)t * QD + (size_t)h * 2 * HD;
-            for (int s = 0; s <= pos; s++) {
-                const uint16_t *kt = kc + (size_t)s * kvd + kvh * HD;
-                __m512 a0 = _mm512_setzero_ps();
-                for (int i = 0; i < HD; i += 16) a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), f16x16(kt + i), a0);
-                att[s] = _mm512_reduce_add_ps(a0) * scale;
+        for (int item = 0; item < nqb * NKV; item++) {
+            const int qb = nqb - 1 - item / NKV, kvh = item % NKV;      // longest first
+            const int tq0 = qb * QB, tq1 = tq0 + QB < T ? tq0 + QB : T, nt = tq1 - tq0;
+            const int S = pos0 + tq1;                                   // keys needed by the last query
+            const float *qp[64];
+            int qpos[64];
+            for (int a = 0; a < nt; a++)
+                for (int g = 0; g < gqa; g++) {
+                    qp[a * gqa + g] = QG + (size_t)(tq0 + a) * QD + (size_t)(kvh * gqa + g) * 2 * HD;
+                    qpos[a * gqa + g] = pos0 + tq0 + a;
+                }
+            const int nq = nt * gqa;
+            for (int kb = 0; kb < S; kb += KB) {
+                const int ke = kb + KB < S ? kb + KB : S;
+                for (int k = kb; k < ke; k++)
+                    for (int i = 0; i < HD; i += 16)
+                        _mm512_storeu_ps(Kf + (size_t)(k - kb) * HD + i, f16x16(kc + (size_t)k * kvd + kvh * HD + i));
+                for (int q = 0; q < nq; q++) {
+                    const int lim = qpos[q] + 1 < ke ? qpos[q] + 1 : ke;
+                    float *aq = att + (size_t)q * S_all;
+                    for (int k = kb; k < lim; k++) {
+                        const float *kr = Kf + (size_t)(k - kb) * HD;
+                        __m512 a0 = _mm512_setzero_ps(), a1 = a0;
+                        for (int i = 0; i < HD; i += 32) {
+                            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qp[q] + i), _mm512_load_ps(kr + i), a0);
+                            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(qp[q] + i + 16), _mm512_load_ps(kr + i + 16), a1);
+                        }
+                        aq[k] = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) * scale;
+                    }
+                }
             }
-            softmax_inplace(att, pos + 1);
-            float *o = AO + (size_t)t * NH * HD + (size_t)h * HD;
-            __m512 acc[16];
-            const int nv = HD / 16;
-            for (int i = 0; i < nv; i++) acc[i] = _mm512_setzero_ps();
-            for (int s = 0; s <= pos; s++) {
-                const __m512 a = _mm512_set1_ps(att[s]);
-                const uint16_t *vt = vc + (size_t)s * kvd + kvh * HD;
-                for (int i = 0; i < nv; i++) acc[i] = _mm512_fmadd_ps(a, f16x16(vt + 16 * i), acc[i]);
+            for (int q = 0; q < nq; q++) softmax_inplace(att + (size_t)q * S_all, qpos[q] + 1);
+            memset(acc, 0, (size_t)nq * HD * 4);
+            for (int kb = 0; kb < S; kb += KB) {
+                const int ke = kb + KB < S ? kb + KB : S;
+                for (int k = kb; k < ke; k++)
+                    for (int i = 0; i < HD; i += 16)
+                        _mm512_storeu_ps(Vf + (size_t)(k - kb) * HD + i, f16x16(vc + (size_t)k * kvd + kvh * HD + i));
+                for (int q = 0; q < nq; q++) {
+                    const int lim = qpos[q] + 1 < ke ? qpos[q] + 1 : ke;
+                    const float *aq = att + (size_t)q * S_all;
+                    float *o = acc + (size_t)q * HD;
+                    for (int i0 = 0; i0 < HD; i0 += 128) {
+                        __m512 r[8];
+                        for (int j = 0; j < 8; j++) r[j] = _mm512_loadu_ps(o + i0 + 16 * j);
+                        for (int k = kb; k < lim; k++) {
+                            const __m512 a = _mm512_set1_ps(aq[k]);
+                            const float *vr = Vf + (size_t)(k - kb) * HD + i0;
+                            for (int j = 0; j < 8; j++) r[j] = _mm512_fmadd_ps(a, _mm512_load_ps(vr + 16 * j), r[j]);
+                        }
+                        for (int j = 0; j < 8; j++) _mm512_storeu_ps(o + i0 + 16 * j, r[j]);
+                    }
+                }
             }
-            const float *gate = qh + HD;
-            for (int i = 0; i < nv; i++) _mm512_storeu_ps(o + 16 * i, acc[i]);
-            for (int i = 0; i < HD; i++) o[i] *= sigmoidf(gate[i]);
+            for (int a = 0; a < nt; a++)
+                for (int g = 0; g < gqa; g++) {
+                    const int q = a * gqa + g, h = kvh * gqa + g;
+                    float *o = AO + (size_t)(tq0 + a) * NH * HD + (size_t)h * HD;
+                    const float *gate = qp[q] + HD;
+                    for (int i = 0; i < HD; i++) o[i] = acc[(size_t)q * HD + i] * sigmoidf(gate[i]);
+                }
         }
-        free(att);
+        free(att); free(Kf); free(Vf); free(acc);
     }
     mm(&L->wo, AO, NH * HD, T, b->R, D);
 }
