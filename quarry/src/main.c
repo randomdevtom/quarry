@@ -19,6 +19,7 @@
 
 #include "inkling.h"
 #include "model.h"
+#include "qwen35.h"
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
@@ -26,8 +27,12 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 
 typedef struct {
     int ink;                           // 1: Inkling 2, 0: Qwen3-MoE
+    int q35;                           // 1: Qwen3.5/3.6 MoE (gated delta net + attention)
     qmodel m;
     ink_model im;
+    q35_model qm;
+    void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
+    int t_think_end, think, think_default;   // q35: "</think>" token; thinking on for this request / by default
     // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
     int t_think, t_text, t_end_msg, t_msg_model, mode, show_thinking;
     float effort;
@@ -50,8 +55,17 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     e->tok_model = llama_model_load_from_file(path, mp);
     if (!e->tok_model) return -1;
     e->vocab = llama_model_get_vocab(e->tok_model);
-    e->ink = ink_detect(path);
-    if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
+    e->q35 = q35_detect(path);
+    e->ink = !e->q35 && ink_detect(path);
+    // Qwen3-Coder (qwen3moe) default: 6 of its 8 routed experts per token. Same HumanEval
+    // score in our tests, ~10-25% faster. `--experts 8` (or QUARRY_TOPK=8) restores the exact model.
+    if (!e->q35 && !e->ink && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
+    if (e->q35) {
+        if (q35_load(&e->qm, path, n_ctx)) return -1;
+        e->snap = malloc(q35_state_bytes(&e->qm));
+        int t[8];
+        e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
+    } else if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
     if (e->ink) {
         int t[8];
         const char *names[4] = {"<|content_thinking|>", "<|content_text|>", "<|end_message|>", "<|message_model|>"};
@@ -79,10 +93,14 @@ static int piece(engine *e, int tok, char *buf, int cap) {
 
 static int is_eog(engine *e, int tok) { return llama_vocab_is_eog(e->vocab, tok); }
 
-static int n_vocab(engine *e) { return e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
-static uint64_t bytes_read(engine *e) { return e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
-static float *fwd(engine *e, int tok, int pos) { return e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos); }
+static int n_vocab(engine *e) { return e->q35 ? e->qm.c.n_vocab : e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
+static uint64_t bytes_read(engine *e) { return e->q35 ? e->qm.expert_bytes_read : e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
+static struct expert_store *eng_experts(engine *e) { return e->q35 ? e->qm.experts : e->ink ? e->im.experts : e->m.experts; }
+static float *fwd(engine *e, int tok, int pos) {
+    return e->q35 ? q35_forward(&e->qm, tok, pos) : e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos);
+}
 static float *prefill(engine *e, const int *toks, int n, int pos0) {
+    if (e->q35) return q35_prefill(&e->qm, toks, n, pos0);
     if (!e->ink) return model_prefill(&e->m, toks, n, pos0);
     float *lg = NULL;
     for (int i = 0; i < n; i++) lg = ink_forward(&e->im, toks[i], pos0 + i);
@@ -126,6 +144,24 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
     int common = 0;
     while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
     if (common == n) common = n - 1;   // need logits for the last token
+    if (e->q35) {
+        // the delta-net state can't be rewound: continue from the current end, or from the
+        // snapshot taken at the end of the last prompt, or start over
+        if (!(common == e->n_ctx_tokens && common > 0)) {
+            if (e->snap_pos > 0 && common >= e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; }
+            else {
+                memset(e->qm.S, 0, (size_t)e->qm.n_rec * e->qm.c.n_vh * e->qm.c.dv * e->qm.c.dk * 4);
+                memset(e->qm.conv, 0, (size_t)e->qm.n_rec * (e->qm.c.n_conv - 1) * e->qm.c.conv_dim * 4);
+                common = 0;
+            }
+        }
+        float *lg = prefill(e, toks + common, n - common, common);
+        for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
+        e->n_ctx_tokens = n;
+        q35_state_save(&e->qm, e->snap);
+        e->snap_pos = n;
+        return lg;
+    }
     float *lg = prefill(e, toks + common, n - common, common);
     for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
     e->n_ctx_tokens = n;
@@ -150,12 +186,19 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     t0 = now();
     char buf[256];
     int pos = n, g = 0;
-    e->mode = e->ink ? 0 : 2;
+    e->mode = e->ink ? 0 : e->q35 && e->think ? 1 : 2;
     for (; g < max_tokens; g++) {
         int tok = sample(e, lg, temp, top_p);
         if (is_eog(e, tok)) break;
         int stop = 0;
-        if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
+        if (e->q35 && tok == e->t_think_end && e->mode == 1) {
+            // end of the thinking block: what follows is the answer
+            if (e->show_thinking) stop = emit("\033[0m\n", ud);
+            e->mode = 2;
+        } else if (e->q35 && e->mode == 1) {
+            piece(e, tok, buf, sizeof buf);
+            if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
+        } else if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
             // Inkling structure tokens: switch between thinking and answer, print nothing
             const int was = e->mode;
             e->mode = tok == e->t_think ? 1 : tok == e->t_text ? 2 : 0;
@@ -175,6 +218,8 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     st->t_gen = now() - t0;
     free(toks);
 }
+
+static char *chat_q35(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 
 // chat prompt from role/content pairs: ChatML for Qwen, Inkling's own format otherwise
 static engine *g_eng;
@@ -233,7 +278,9 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         }
         if (nm >= 62) nm = 0;
         roles[nm] = "user"; contents[nm++] = prompt;
-        char *p = chatml(roles, contents, nm);
+        const char *tcnull[64] = {0};
+        e->think = e->think_default;
+        char *p = e->q35 ? chat_q35(roles, contents, tcnull, nm, NULL, e->think) : chatml(roles, contents, nm);
         char *reply = calloc(1, 1 << 20);
         gen_stats st = {0};
         acc_t acc = {reply, 0};
@@ -243,7 +290,7 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         fprintf(stderr, "\n[%d prompt tokens %.1fs | %d tokens %.2f tok/s]\n", st.prompt_tokens, st.t_prompt,
                 st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
         if (getenv("QUARRY_STATS")) {
-            struct expert_store *es = e->ink ? e->im.experts : e->m.experts;
+            struct expert_store *es = eng_experts(e);
             uint64_t h, mi, pi, pu;
             experts_stats(es, &h, &mi, &pi, &pu);
             fprintf(stderr, "[experts: hit %.1f%%, prefetch %llu issued / %llu used, io wait %.1fs, SSD %.2f GB",
@@ -543,6 +590,85 @@ static char *chat_qwen(const char **roles, const char **contents, const char **t
     return b.p;
 }
 
+// Qwen3.5/3.6 chat template (as in the GGUF): tools as JSON lines, system text after the
+// tool block, thinking off unless asked (the generation prompt closes an empty <think>)
+static char *chat_q35(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think) {
+    sbuf b = {0};
+    int has_tools = tools && *skip_ws(tools) == '[' && *skip_ws(skip_ws(tools) + 1) != ']';
+    const int sys0 = n > 0 && !strcmp(roles[0], "system");
+    if (has_tools) {
+        sb_put(&b, "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        const char *nx, *t = json_arr_next(tools, &nx);
+        for (; t; t = json_arr_next(nx, &nx)) { char *raw = json_raw(t); sb_put(&b, "\n"); sb_put(&b, raw); free(raw); }
+        sb_put(&b, "\n</tools>");
+        sb_put(&b, "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+        if (sys0) {
+            sbuf t2 = {0}; put_trimmed(&t2, contents[0]);
+            if (t2.n) { sb_put(&b, "\n\n"); sb_put(&b, t2.p); }
+            free(t2.p);
+        }
+        sb_put(&b, "<|im_end|>\n");
+    } else if (sys0) {
+        sb_put(&b, "<|im_start|>system\n"); put_trimmed(&b, contents[0]); sb_put(&b, "<|im_end|>\n");
+    }
+    // index of the last real user query (not a wrapped tool response)
+    int last_q = n - 1;
+    for (int i = n - 1; i >= 0; i--) {
+        if (strcmp(roles[i], "user")) continue;
+        sbuf t2 = {0}; put_trimmed(&t2, contents[i]);
+        int wrapped = t2.n >= 31 && !strncmp(t2.p, "<tool_response>", 15) && !strcmp(t2.p + t2.n - 16, "</tool_response>");
+        free(t2.p);
+        if (!wrapped) { last_q = i; break; }
+    }
+    for (int i = sys0; i < n; i++) {
+        const char *r = roles[i];
+        if (!strcmp(r, "system")) continue;   // only allowed first
+        if (!strcmp(r, "user")) {
+            sb_put(&b, "<|im_start|>user\n"); put_trimmed(&b, contents[i]); sb_put(&b, "<|im_end|>\n");
+        } else if (!strcmp(r, "assistant")) {
+            // drop any reasoning from the content; after the last query keep an (empty) think block
+            const char *c = contents[i], *te = strstr(c, "</think>");
+            if (te) { c = te + 8; while (*c == '\n') c++; }
+            sbuf ct = {0}; put_trimmed(&ct, c);
+            sb_put(&b, "<|im_start|>assistant\n");
+            if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
+            if (ct.n) sb_put(&b, ct.p);
+            if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
+                const char *nx, *tc = json_arr_next(tcalls[i], &nx);
+                for (int k = 0; tc; tc = json_arr_next(nx, &nx), k++) {
+                    const char *f = json_get(tc, "function"), *v;
+                    if (!f) f = tc;
+                    char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+                    sb_put(&b, k ? "\n<tool_call>\n<function=" : ct.n ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=");
+                    sb_put(&b, name); sb_put(&b, ">\n");
+                    if ((v = json_get(f, "arguments"))) {
+                        char *args = *skip_ws(v) == '"' ? json_str(skip_ws(v), NULL) : json_raw(v);
+                        if (*skip_ws(args) == '{') {
+                            char *key; const char *av, *it = skip_ws(args);
+                            while ((it = json_obj_next(it, &key, &av))) {
+                                char *val = *skip_ws(av) == '"' ? json_str(skip_ws(av), NULL) : json_raw(av);
+                                sb_put(&b, "<parameter="); sb_put(&b, key); sb_put(&b, ">\n"); sb_put(&b, val); sb_put(&b, "\n</parameter>\n");
+                                free(val); free(key);
+                            }
+                        }
+                        free(args);
+                    }
+                    sb_put(&b, "</function>\n</tool_call>");
+                    free(name);
+                }
+            }
+            sb_put(&b, "<|im_end|>\n");
+            free(ct.p);
+        } else if (!strcmp(r, "tool")) {
+            if (i == sys0 || strcmp(roles[i - 1], "tool")) sb_put(&b, "<|im_start|>user");
+            sb_put(&b, "\n<tool_response>\n"); put_trimmed(&b, contents[i]); sb_put(&b, "\n</tool_response>");
+            if (i == n - 1 || strcmp(roles[i + 1], "tool")) sb_put(&b, "<|im_end|>\n");
+        }
+    }
+    sb_put(&b, think ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    return b.p;
+}
+
 // schema type of parameter `param` of function `fn` in the tools array ("" if unknown)
 static char *tool_param_type(const char *tools, const char *fn, const char *param) {
     if (!tools || *skip_ws(tools) != '[') return strdup("");
@@ -757,7 +883,16 @@ static void handle(engine *e, int fd) {
         int stream = (v = json_get(body, "stream")) && !strncmp(skip_ws(v), "true", 4);
         const char *tools = json_get(body, "tools");
         if (tools && *skip_ws(tools) != '[') tools = NULL;
-        char *prompt = e->ink ? chatml(roles, contents, nm) : chat_qwen(roles, contents, tcalls, nm, tools);
+        // thinking (Qwen3.5/3.6): "chat_template_kwargs": {"enable_thinking": true}, or top-level
+        // "enable_thinking"; default from --think
+        int think = e->think_default;
+        const char *ck = json_get(body, "chat_template_kwargs");
+        if (ck && (v = json_get(ck, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
+        if ((v = json_get(body, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
+        e->think = think;
+        char *prompt = e->ink ? chatml(roles, contents, nm)
+                     : e->q35 ? chat_q35(roles, contents, tcalls, nm, tools, think)
+                     : chat_qwen(roles, contents, tcalls, nm, tools);
         req_ctx rc = {fd, stream, calloc(1, 1), 0, 1, 0, (long)time(NULL), tools != NULL && !e->ink, 0, 0};
         if (stream) {
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%s\r\n", cors);
@@ -862,6 +997,7 @@ static int cmd_bench_prefill(engine *e, const char *path) {
     if (n <= 0 || n >= e->n_ctx) { fprintf(stderr, "prompt has %d tokens, ctx %d\n", n, e->n_ctx); return 1; }
     for (int run = 0; run < 2; run++) {
         memset(qt_pf, 0, sizeof qt_pf);
+        memset(q35_prof, 0, sizeof q35_prof); memset(q35_mp, 0, sizeof q35_mp);
         uint64_t b0 = bytes_read(e);
         e->n_ctx_tokens = 0;
         double t0 = now();
@@ -870,6 +1006,8 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         printf("%s: %d tokens in %.1fs = %.1f tok/s | SSD %.2f GB | attn mm %.1fs, attn %.1fs, route %.1fs, experts %.1fs (io wait %.1fs, gate+up %.1fs, down %.1fs)\n",
                run ? "warm" : "cold", n, dt, n / dt, (bytes_read(e) - b0) / 1e9,
                qt_pf[0], qt_pf[1], qt_pf[2], qt_pf[3], qt_pf[4], qt_pf[5], qt_pf[6]);
+        if (e->q35) printf("  q35: delta-net %.1fs (proj %.1fs, conv+norm %.1fs, recur %.1fs), attention %.1fs, moe %.1fs\n", q35_prof[0], q35_prof[6], q35_prof[7], q35_prof[4], q35_prof[1], q35_prof[3]);
+        if (e->q35) printf("  moe: shared %.1fs, route %.1fs, cached experts %.1fs, streamed %.1fs, stream wait %.1fs | repack (thread 0) q3k %.1fs, other %.1fs\n", q35_mp[0], q35_mp[1], q35_mp[2], q35_mp[3], q35_mp[4], q35_mp[5], q35_mp[6]);
     }
     free(toks);
     return 0;
@@ -926,12 +1064,14 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1], *model = NULL, *prompt = NULL, *host = "127.0.0.1";
     int n = 1024, port = 8090, ctx = 4096;
     float temp = 0.7f, effort = 0.2f;
+    int think_flag = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--experts") && i + 1 < argc) setenv("QUARRY_TOPK", argv[++i], 1);
+        else if (!strcmp(argv[i], "--think")) think_flag = 1;
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -950,11 +1090,9 @@ int main(int argc, char **argv) {
         execv("/proc/self/exe", argv);
     }
     engine e;
-    // Qwen3-MoE default: 6 of its 8 routed experts per token. Same HumanEval score in our
-    // tests, ~10-25% faster. `--experts 8` (or QUARRY_TOPK=8) restores the exact model.
-    if (!getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (eng_load(&e, model, ctx)) { fprintf(stderr, "failed to load %s\n", model); return 1; }
     e.effort = effort;
+    e.think_default = think_flag;
     g_eng = &e;
     if (!strcmp(cmd, "run")) return cmd_run(&e, prompt, n, temp);
     if (!strcmp(cmd, "serve")) return cmd_serve(&e, host, port);

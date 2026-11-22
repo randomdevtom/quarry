@@ -8,7 +8,7 @@ ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libllama.so),)
 LLAMA_FLAGS = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -L$(LLAMA_DIR)/build/bin -Wl,-rpath,$(abspath $(LLAMA_DIR)/build/bin)
 endif
 LLAMA_LIBS = $(LLAMA_FLAGS) -lllama -lggml -lggml-base
-CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c
+CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c
 
 all: build/quarry build/quarry-bench build/quarry-info
 
@@ -29,9 +29,11 @@ test: build/quarry
 	$(CC) $(CFLAGS) $(CORE) tests/test_forward.c -o build/test_forward $(LDLIBS)
 	$(CC) $(CFLAGS) $(CORE) tests/test_inkling.c -o build/test_inkling $(LDLIBS)
 	$(CC) $(CFLAGS) src/qgguf.c src/quants.c tests/test_quants2.c -o build/test_quants2 $(LDLIBS)
+	$(CC) $(CFLAGS) $(CORE) tests/test_q35.c -o build/test_q35 $(LDLIBS)
 
-ref: tests/ref_dump.c
+ref: tests/ref_dump.c tests/ref_logits.c
 	$(CC) -O2 -Wno-deprecated-declarations tests/ref_dump.c -o build/ref_dump $(LLAMA_LIBS)
+	$(CC) -O2 -Wno-deprecated-declarations tests/ref_logits.c -o build/ref_logits $(LLAMA_LIBS)
 
 clean:
 	rm -rf build
