@@ -145,8 +145,8 @@ else
 fi
 ARCH="$("$QDIR/build/quarry-info" "$MODEL" 2>/dev/null | sed -n 's/^arch: \([^ ]*\).*/\1/p' | head -1)"
 case "$ARCH" in
-  qwen35moe|qwen3moe|inkling2_loop) ok "architecture: $ARCH" ;;
-  *) die "unsupported model architecture '${ARCH:-unknown}' (Quarry runs qwen35moe, qwen3moe and inkling2_loop)" ;;
+  qwen35moe|qwen3moe|mellum|inkling2_loop) ok "architecture: $ARCH" ;;
+  *) die "unsupported model architecture '${ARCH:-unknown}' (Quarry runs qwen35moe, qwen3moe, mellum and inkling2_loop)" ;;
 esac
 
 # ---------- 5. settings for this machine ----------

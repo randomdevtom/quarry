@@ -13,6 +13,7 @@
 
 typedef struct {
     int is_attn;
+    int is_swa;                     // Mellum: sliding-window attention layer (plain RoPE)
     float *attn_norm, *post_norm;
     // full attention
     qmat wq, wk, wv, wo;            // wq: [n_head * 2 * hd] rows = per head [q | gate]
@@ -37,6 +38,10 @@ typedef struct {
     int n_kh, n_vh, dk, dv, n_conv;    // delta net: key heads, value heads, head dims, conv taps
     int key_dim, value_dim, conv_dim;
     float eps, rope_base;
+    // Mellum (all-attention variant): no q gate, no shared expert, sliding window on some
+    // layers, YaRN RoPE on the others
+    int mellum, gated, n_swa;
+    float rope_base_swa, yarn_freq_scale, yarn_mscale, yarn_corr[2];
 } q35_cfg;
 
 typedef struct q35_model {

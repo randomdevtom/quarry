@@ -74,7 +74,9 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     e->ink = !e->q35 && ink_detect(path);
     // Qwen MoE default: 6 of the 8 routed experts per token. Same HumanEval score in our tests
     // (Qwen3-Coder 19/21, Qwen3.8 distill 20/21), 10-25% faster. `--experts 8` restores the exact model.
-    if (!e->ink && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
+    int is_mellum = 0;
+    { qg_file g; if (!qg_open(&g, path)) { const char *a = qg_get_str(&g, "general.architecture"); is_mellum = a && !strcmp(a, "mellum"); qg_close(&g); } }
+    if (!e->ink && !is_mellum && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);   // Mellum: untested at 6, keep 8
     if (e->q35) {
         if (q35_load(&e->qm, path, n_ctx)) return -1;
         e->snap = malloc(q35_state_bytes(&e->qm));
@@ -296,6 +298,7 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
 }
 
 static char *chat_q35(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
+static char *chat_mellum(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 
 // chat prompt from role/content pairs: ChatML for Qwen, Inkling's own format otherwise
 static engine *g_eng;
@@ -356,7 +359,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         roles[nm] = "user"; contents[nm++] = prompt;
         const char *tcnull[64] = {0};
         e->think = e->think_default;
-        char *p = e->q35 ? chat_q35(roles, contents, tcnull, nm, NULL, e->think) : chatml(roles, contents, nm);
+        char *p = e->q35 && e->qm.c.mellum ? chat_mellum(roles, contents, tcnull, nm, NULL, e->think)
+                : e->q35 ? chat_q35(roles, contents, tcnull, nm, NULL, e->think) : chatml(roles, contents, nm);
         char *reply = calloc(1, 1 << 20);
         gen_stats st = {0};
         acc_t acc = {reply, 0};
@@ -750,6 +754,69 @@ static char *chat_q35(const char **roles, const char **contents, const char **tc
     return b.p;
 }
 
+// Mellum 2.1 (its GGUF chat template): ChatML, system text before the tool list, tool calls as
+// JSON inside <tool_call>, reasoning kept only on turns after the last user query
+static char *chat_mellum(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think) {
+    sbuf b = {0};
+    const int has_tools = tools && *skip_ws(tools) == '[' && *skip_ws(skip_ws(tools) + 1) != ']';
+    const int sys0 = n > 0 && !strcmp(roles[0], "system");
+    if (has_tools) {
+        sb_put(&b, "<|im_start|>system\n");
+        if (sys0) { sb_put(&b, contents[0]); sb_put(&b, "\n\n"); }
+        sb_put(&b, "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+        const char *nx, *t = json_arr_next(tools, &nx);
+        for (; t; t = json_arr_next(nx, &nx)) { char *raw = json_raw(t); sb_put(&b, "\n"); sb_put(&b, raw); free(raw); }
+        sb_put(&b, "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n");
+    } else if (sys0) {
+        sb_put(&b, "<|im_start|>system\n"); sb_put(&b, contents[0]); sb_put(&b, "<|im_end|>\n");
+    }
+    int last_q = n - 1;
+    for (int i = n - 1; i >= 0; i--) {
+        if (strcmp(roles[i], "user")) continue;
+        const char *c = contents[i];
+        const size_t l = strlen(c);
+        if (!(l >= 31 && !strncmp(c, "<tool_response>", 15) && !strcmp(c + l - 16, "</tool_response>"))) { last_q = i; break; }
+    }
+    for (int i = 0; i < n; i++) {
+        const char *r = roles[i];
+        if (!strcmp(r, "user") || (!strcmp(r, "system") && i > 0)) {
+            sb_put(&b, "<|im_start|>"); sb_put(&b, r); sb_put(&b, "\n"); sb_put(&b, contents[i]); sb_put(&b, "<|im_end|>\n");
+        } else if (!strcmp(r, "assistant")) {
+            const char *c = contents[i], *te = strstr(c, "</think>");
+            if (te) { c = te + 8; while (*c == '\n') c++; }
+            sb_put(&b, "<|im_start|>assistant\n");
+            sb_put(&b, c);
+            if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
+                const char *nx, *tc = json_arr_next(tcalls[i], &nx);
+                for (int k = 0; tc; tc = json_arr_next(nx, &nx), k++) {
+                    const char *f = json_get(tc, "function"), *v;
+                    if (!f) f = tc;
+                    if (k || *c) sb_put(&b, "\n");
+                    char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+                    sb_put(&b, "<tool_call>\n{\"name\": \""); sb_put(&b, name); sb_put(&b, "\", \"arguments\": ");
+                    if ((v = json_get(f, "arguments"))) {
+                        char *args = *skip_ws(v) == '"' ? json_str(skip_ws(v), NULL) : json_raw(v);
+                        sb_put(&b, args);
+                        free(args);
+                    } else sb_put(&b, "{}");
+                    sb_put(&b, "}\n</tool_call>");
+                    free(name);
+                }
+            }
+            sb_put(&b, "<|im_end|>\n");
+        } else if (!strcmp(r, "tool")) {
+            if (i == 0 || strcmp(roles[i - 1], "tool")) sb_put(&b, "<|im_start|>user");
+            sb_put(&b, "\n<tool_response>\n"); sb_put(&b, contents[i]); sb_put(&b, "\n</tool_response>");
+            if (i == n - 1 || strcmp(roles[i + 1], "tool")) sb_put(&b, "<|im_end|>\n");
+        }
+    }
+    (void)last_q;
+    // with thinking on the model opens <think> itself; starting it here keeps the tag out of the
+    // streamed reasoning (same tokens either way)
+    sb_put(&b, think ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    return b.p;
+}
+
 // schema type of parameter `param` of function `fn` in the tools array ("" if unknown)
 static char *tool_param_type(const char *tools, const char *fn, const char *param) {
     if (!tools || *skip_ws(tools) != '[') return strdup("");
@@ -803,6 +870,25 @@ static char *parse_tool_calls(const char *text, const char *tools, long id, size
     for (const char *p = first; (p = strstr(p, "<tool_call>")); k++) {
         const char *end = strstr(p, "</tool_call>");
         const char *fn = strstr(p, "<function=");
+        const char *js = skip_ws(p + 11);
+        if (*js == '{' && (!fn || (end && fn > end))) {   // JSON form: {"name": ..., "arguments": {...}}
+            const char *v;
+            char *name = (v = json_get(js, "name")) ? json_str(skip_ws(v), NULL) : NULL;
+            if (!name) break;
+            const char *av = json_get(js, "arguments");
+            char *args = !av ? strdup("{}") : *skip_ws(av) == '"' ? json_str(skip_ws(av), NULL) : json_raw(av);
+            size_t cap = strlen(args) * 2 + 16;
+            char *aesc = malloc(cap), nesc[512], head[1024];
+            json_escape(args, aesc, cap);
+            json_escape(name, nesc, sizeof nesc);
+            snprintf(head, sizeof head, "%s{\"index\":%d,\"id\":\"call_%ld_%d\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"",
+                     k ? "," : "", k, id, k, nesc);
+            sb_put(&out, head); sb_put(&out, aesc); sb_put(&out, "\"}}");
+            free(aesc); free(args); free(name);
+            if (!end) { k++; break; }
+            p = end + 12;
+            continue;
+        }
         if (!fn || (end && fn > end)) break;
         fn += 10;
         const char *fe = strchr(fn, '>');
@@ -1059,7 +1145,7 @@ static void handle(engine *e, int fd) {
             "{\"model\":\"%s\",\"arch\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,\"cache_gb\":%.1f,"
             "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
             "\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
-            e->model_name, e->q35 ? "qwen35moe" : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
+            e->model_name, e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
             getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
             h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
             e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
@@ -1104,6 +1190,7 @@ static void handle(engine *e, int fd) {
         if ((v = json_get(body, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
         e->think = think;
         char *prompt = e->ink ? chatml(roles, contents, nm)
+                     : e->q35 && e->qm.c.mellum ? chat_mellum(roles, contents, tcalls, nm, tools, think)
                      : e->q35 ? chat_q35(roles, contents, tcalls, nm, tools, think)
                      : chat_qwen(roles, contents, tcalls, nm, tools);
         req_ctx rc = {fd, stream, calloc(1, 1), 0, 1, 0, (long)time(NULL), tools != NULL && !e->ink, 0, 0};

@@ -61,6 +61,23 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 - the output layer (248K vocab) runs from a 4-bit copy that picks 64 candidates, whose exact
   logits are computed from the file's rows (`QUARRY_EXACT_OUTPUT=1` keeps the full matrix in RAM)
 
+### Mellum 2.1 12B-A2.5B Thinking (Q4_0, 7.0GB, `mellum`)
+
+JetBrains' coding MoE: 28 attention layers (3 of every 4 with a 1024-token sliding window, the
+others with YaRN RoPE), 64 experts, 8 used.
+
+| setup | Quarry | llama.cpp |
+|---|---|---|
+| whole model fits in RAM | 8.6 tok/s | 9.2 tok/s |
+| 4GB memory limit (an 8GB laptop with a browser open) | **7.2 tok/s** | 3.5 tok/s (mmap; default settings are killed for running out of memory) |
+| 1.5GB expert cache | 4.2 tok/s | |
+
+- logits match llama.cpp (cosine 0.9999, same top token), on a 2465-token prompt as well,
+  token by token and batched
+- tool calls in Mellum's JSON format, thinking on request
+- the 4GB rows use a cgroup limit (`systemd-run --user --scope -p MemoryMax=4G`), with the model
+  file evicted from the page cache first
+
 ### Inkling 2 Mini (Q4_K_M, 18.7GB, `inkling2_loop`)
 
 | engine | generation tok/s |
@@ -173,7 +190,7 @@ laptop like this one. Later turns reuse the cached prefix and only process what'
   snapshotted at the end of each prompt for prefix reuse.
 - `src/inkling.c`: Inkling 2 forward pass (looped layers, block-residual mixing,
   relative-position attention with sinks, short convolutions, sigmoid-routed MoE).
-- `src/quants.c`: Q3_K, Q4_K, Q5_K, Q6_K, Q5_0 and Q8_0 kernels (AVX-512 VNNI),
+- `src/quants.c`: Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0 and Q8_0 kernels (AVX-512 VNNI),
   checked against gguf-py. Q3_K matvec reaches ~21GB/s on 2 cores, close to RAM speed.
 - `src/qgguf.c`: GGUF reader. Dense tensors are loaded into RAM, experts are addressed
   by file offset.
@@ -185,7 +202,7 @@ and MBPP against a running server.
 
 ## Limits
 
-- architectures: qwen3moe, qwen35moe (Qwen3.5/3.6 MoE text), inkling2_loop
+- architectures: qwen3moe, qwen35moe (Qwen3.5/3.6 MoE text), mellum, inkling2_loop
 - x86-64 with AVX-512 VNNI only (Ice Lake or newer, Zen 4 or newer)
 - one sequence at a time; batched prompt processing for Qwen3-Coder (Q3_K weights) and
   Qwen3.5/3.6 (Q3_K-Q6_K); Inkling runs token by token

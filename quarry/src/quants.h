@@ -81,6 +81,12 @@ _Static_assert(sizeof(block_q5_0) == 22, "q5_0 size");
 _Static_assert(sizeof(block_q4_K) == 144, "q4_K size");
 _Static_assert(sizeof(block_q5_K) == 176, "q5_K size");
 
+typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0;                         // 18 bytes
+typedef struct { uint16_t d, m; uint8_t qs[16]; } block_q4_1;                      // 20 bytes
+_Static_assert(sizeof(block_q4_0) == 18, "q4_0 size");
+_Static_assert(sizeof(block_q4_1) == 20, "q4_1 size");
+void dequant_row_q4_0(const block_q4_0 *x, float *y, int64_t n);
+void dequant_row_q4_1(const block_q4_1 *x, float *y, int64_t n);
 void dequant_row_q8_0(const block_q8_0 *x, float *y, int64_t n);
 void dequant_row_q5_0(const block_q5_0 *x, float *y, int64_t n);
 void dequant_row_q4_K(const block_q4_K *x, float *y, int64_t n);
@@ -94,6 +100,8 @@ void quantize_row_a32(const float *x, act32 a, int64_t n);
 
 float vec_dot_q8_0_a32(int n, const block_q8_0 *x, act32 a);
 float vec_dot_q5_0_a32(int n, const block_q5_0 *x, act32 a);
+float vec_dot_q4_0_a32(int n, const block_q4_0 *x, act32 a);
+float vec_dot_q4_1_a32(int n, const block_q4_1 *x, act32 a);
 float vec_dot_q4_K_q8_K(int n, const block_q4_K *x, const block_q8_K *y);
 float vec_dot_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y);
 

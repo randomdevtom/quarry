@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
     struct llama_model *model = llama_model_load_from_file(argv[1], llama_model_default_params());
     const struct llama_vocab *vocab = llama_model_get_vocab(model);
     struct llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 512; cp.n_threads = 4; cp.n_threads_batch = 4;
+    cp.n_ctx = getenv("REF_CTX") ? atoi(getenv("REF_CTX")) : 512; cp.n_batch = cp.n_ubatch = cp.n_ctx; cp.n_threads = 4; cp.n_threads_batch = 4;
     struct llama_context *ctx = llama_init_from_model(model, cp);
     const char *p = argv[2];
     int n = -llama_tokenize(vocab, p, strlen(p), NULL, 0, true, true);

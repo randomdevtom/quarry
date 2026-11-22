@@ -515,9 +515,30 @@ void dequant_row_q5_K(const block_q5_K *x, float *y, int64_t n) {
     }
 }
 
+void dequant_row_q4_0(const block_q4_0 *x, float *y, int64_t n) {
+    for (int64_t b = 0; b < n / 32; b++) {
+        const float d = fp16_to_fp32(x[b].d);
+        for (int j = 0; j < 16; j++) {
+            y[b * 32 + j] = d * ((x[b].qs[j] & 0xF) - 8);
+            y[b * 32 + j + 16] = d * ((x[b].qs[j] >> 4) - 8);
+        }
+    }
+}
+void dequant_row_q4_1(const block_q4_1 *x, float *y, int64_t n) {
+    for (int64_t b = 0; b < n / 32; b++) {
+        const float d = fp16_to_fp32(x[b].d), m = fp16_to_fp32(x[b].m);
+        for (int j = 0; j < 16; j++) {
+            y[b * 32 + j] = d * (x[b].qs[j] & 0xF) + m;
+            y[b * 32 + j + 16] = d * (x[b].qs[j] >> 4) + m;
+        }
+    }
+}
+
 int dequant_row(int type, const void *x, float *y, int64_t n) {
     switch (type) {
     case 0: memcpy(y, x, n * 4); return 0;
+    case 2: dequant_row_q4_0(x, y, n); return 0;
+    case 3: dequant_row_q4_1(x, y, n); return 0;
     case 6: dequant_row_q5_0(x, y, n); return 0;
     case 8: dequant_row_q8_0(x, y, n); return 0;
     case 11: dequant_row_q3_K(x, y, n); return 0;
@@ -576,6 +597,76 @@ static inline __m256i q5_0_u(const block_q5_0 *x) {
                                          _mm_and_si128(q, _mm_set1_epi8(0xF)));
     uint32_t qh; memcpy(&qh, x->qh, 4);
     return _mm256_or_si256(nib, _mm256_maskz_set1_epi8((__mmask32)qh, 0x10));
+}
+
+// 32 nibbles of a Q4_0/Q4_1 block in natural order (low nibbles = values 0..15, high = 16..31)
+static inline __m256i q4_nib(const uint8_t *qs) {
+    const __m128i q = _mm_loadu_si128((const __m128i *)qs);
+    return _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0xF)), _mm_and_si128(q, _mm_set1_epi8(0xF)));
+}
+// Q4_0: value = d * (u - 8): sum(u*x) - 8*sum(x). Four blocks per step: scales converted
+// together (F16C), spread to their 8 lanes with one permute; correction kept as a vector.
+float vec_dot_q4_0_a32(int n, const block_q4_0 *x, act32 a) {
+    const int nb = n / 32;
+    __m512 acc = _mm512_setzero_ps(), acc2 = _mm512_setzero_ps();
+    __m128 cv = _mm_setzero_ps();
+    const __m512i lo2 = _mm512_set_epi32(1,1,1,1,1,1,1,1, 0,0,0,0,0,0,0,0);
+    const __m512i hi2 = _mm512_set_epi32(3,3,3,3,3,3,3,3, 2,2,2,2,2,2,2,2);
+    float corr = 0;
+    int b = 0;
+    for (; b + 4 <= nb; b += 4) {
+        const __m512i u0 = _mm512_inserti64x4(_mm512_castsi256_si512(q4_nib(x[b].qs)), q4_nib(x[b + 1].qs), 1);
+        const __m512i u1 = _mm512_inserti64x4(_mm512_castsi256_si512(q4_nib(x[b + 2].qs)), q4_nib(x[b + 3].qs), 1);
+        const __m512i d0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u0, _mm512_loadu_si512((const void *)(a.qs + b * 32)));
+        const __m512i d1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u1, _mm512_loadu_si512((const void *)(a.qs + b * 32 + 64)));
+        const __m128i h = _mm_setr_epi16(x[b].d, x[b + 1].d, x[b + 2].d, x[b + 3].d, 0, 0, 0, 0);
+        const __m128 s4 = _mm_mul_ps(_mm_cvtph_ps(h), _mm_loadu_ps(a.d + b));
+        cv = _mm_fmadd_ps(s4, _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(a.s + b))), cv);
+        const __m512 s16 = _mm512_castps128_ps512(s4);
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d0), _mm512_permutexvar_ps(lo2, s16), acc);
+        acc2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d1), _mm512_permutexvar_ps(hi2, s16), acc2);
+    }
+    {   // fold the vector correction in, then the 2-block tail as before
+        __m128 t = _mm_add_ps(cv, _mm_movehl_ps(cv, cv));
+        t = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
+        corr = _mm_cvtss_f32(t);
+        acc = _mm512_add_ps(acc, acc2);
+    }
+    for (; b + 2 <= nb; b += 2) {
+        const __m512i u = _mm512_inserti64x4(_mm512_castsi256_si512(q4_nib(x[b].qs)), q4_nib(x[b + 1].qs), 1);
+        const __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u, _mm512_loadu_si512((const void *)(a.qs + b * 32)));
+        const float s0 = fp16_to_fp32(x[b].d) * a.d[b], s1 = fp16_to_fp32(x[b + 1].d) * a.d[b + 1];
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), two_scales(s0, s1), acc);
+        corr += s0 * a.s[b] + s1 * a.s[b + 1];
+    }
+    float sum = _mm512_reduce_add_ps(acc) - 8 * corr;
+    for (; b < nb; b++) {
+        float y[32];
+        dequant_row_q4_0(&x[b], y, 32);
+        for (int i = 0; i < 32; i++) sum += y[i] * a.d[b] * a.qs[b * 32 + i];
+    }
+    return sum;
+}
+// Q4_1: value = d * u + m: d*sum(u*x) + m*sum(x)
+float vec_dot_q4_1_a32(int n, const block_q4_1 *x, act32 a) {
+    const int nb = n / 32;
+    __m512 acc = _mm512_setzero_ps();
+    float mins = 0;
+    int b = 0;
+    for (; b + 2 <= nb; b += 2) {
+        const __m512i u = _mm512_inserti64x4(_mm512_castsi256_si512(q4_nib(x[b].qs)), q4_nib(x[b + 1].qs), 1);
+        const __m512i dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u, _mm512_loadu_si512((const void *)(a.qs + b * 32)));
+        const float s0 = fp16_to_fp32(x[b].d) * a.d[b], s1 = fp16_to_fp32(x[b + 1].d) * a.d[b + 1];
+        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dp), two_scales(s0, s1), acc);
+        mins += fp16_to_fp32(x[b].m) * a.d[b] * a.s[b] + fp16_to_fp32(x[b + 1].m) * a.d[b + 1] * a.s[b + 1];
+    }
+    float sum = _mm512_reduce_add_ps(acc) + mins;
+    for (; b < nb; b++) {
+        float y[32];
+        dequant_row_q4_1(&x[b], y, 32);
+        for (int i = 0; i < 32; i++) sum += y[i] * a.d[b] * a.qs[b * 32 + i];
+    }
+    return sum;
 }
 
 // u = q + 16 in 0..31: sum(u*x) - 16*sum(x)

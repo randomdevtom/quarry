@@ -19,7 +19,7 @@ double q35_prof[8], q35_mp[8];   // q35_mp (prefill moe): 0 shared, 1 route, 2 c
 static double qnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 static void *xalloc(size_t n) {
-    const size_t al = n >= (1u << 21) ? (1u << 21) : 64, sz = (n + al - 1) / al * al;
+    const size_t al = n >= (1u << 21) ? (1u << 21) : 64, sz = n ? (n + al - 1) / al * al : al;
     void *p = aligned_alloc(al, sz);
     if (!p) { fprintf(stderr, "out of memory (%zu bytes)\n", n); exit(1); }
     if (al > 64) madvise(p, sz, MADV_HUGEPAGE);
@@ -58,7 +58,7 @@ int q35_detect(const char *path) {
     qg_file g;
     if (qg_open(&g, path)) return 0;
     const char *a = qg_get_str(&g, "general.architecture");
-    int r = a && !strcmp(a, "qwen35moe");
+    int r = a && (!strcmp(a, "qwen35moe") || !strcmp(a, "mellum"));
     qg_close(&g);
     return r;
 }
@@ -73,7 +73,11 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     if (qg_open(&m->g, path)) return -1;
     qg_file *g = &m->g;
     q35_cfg *c = &m->c;
-#define K(s) "qwen35moe." s
+    const char *arch = qg_get_str(g, "general.architecture");
+    c->mellum = arch && !strcmp(arch, "mellum");
+    c->gated = !c->mellum;
+    char kbuf[128];
+#define K(s) (snprintf(kbuf, sizeof kbuf, "%s.%s", c->mellum ? "mellum" : "qwen35moe", s), kbuf)
     // block_count includes the MTP layer(s) at the end
     c->n_layer = qg_get_int(g, K("block_count"), 0) - qg_get_int(g, K("nextn_predict_layers"), 0);
     {
@@ -97,7 +101,26 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     c->n_kh = qg_get_int(g, K("ssm.group_count"), 0);
     c->n_vh = qg_get_int(g, K("ssm.time_step_rank"), 0);
     c->value_dim = qg_get_int(g, K("ssm.inner_size"), 0);
-    c->dv = c->value_dim / c->n_vh;
+    c->dv = c->n_vh ? c->value_dim / c->n_vh : 0;
+    if (c->mellum) {
+        c->n_swa = qg_get_int(g, K("attention.sliding_window"), 0);
+        c->rope_base_swa = qg_get_float(g, K("rope.freq_base_swa"), c->rope_base);
+        // YaRN on the full-attention layers, as ggml's rope_yarn computes it (llama.cpp
+        // context defaults: ext_factor 1, attn_factor cancelled so mscale = 1 + 0.1 ln(factor))
+        const char *st = qg_get_str(g, K("rope.scaling.type"));
+        const float factor = qg_get_float(g, K("rope.scaling.factor"), 1.0f);
+        if (st && !strcmp(st, "yarn") && factor > 1.0f) {
+            c->yarn_freq_scale = 1.0f / factor;
+            c->yarn_mscale = 1.0f + 0.1f * logf(factor);
+            const float orig = (float)qg_get_int(g, K("rope.scaling.original_context_length"), 8192);
+            const float bf = qg_get_float(g, K("rope.scaling.yarn_beta_fast"), 32.0f), bs = qg_get_float(g, K("rope.scaling.yarn_beta_slow"), 1.0f);
+            const float nd = (float)c->hd;
+            const float lo = nd * logf(orig / (bf * 2 * (float)M_PI)) / (2 * logf(c->rope_base));
+            const float hi = nd * logf(orig / (bs * 2 * (float)M_PI)) / (2 * logf(c->rope_base));
+            c->yarn_corr[0] = floorf(lo) > 0 ? floorf(lo) : 0;
+            c->yarn_corr[1] = ceilf(hi) < nd - 1 ? ceilf(hi) : nd - 1;
+        }
+    }
     c->key_dim = c->dk * c->n_kh;
     c->conv_dim = 2 * c->key_dim + c->value_dim;
     c->n_ctx = n_ctx;
@@ -106,7 +129,7 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     if (getenv("QUARRY_TOPK") && atoi(getenv("QUARRY_TOPK")) > 0 && atoi(getenv("QUARRY_TOPK")) < c->n_used) c->n_used = atoi(getenv("QUARRY_TOPK"));
     const qg_tensor *emb = find(g, "token_embd.weight", 1);
     c->n_vocab = emb->ne[1];
-    if (c->dk != c->dv || c->hd > 512 || c->hd % 128 || c->n_head / c->n_head_kv > 8 || c->n_used > 16 || c->n_conv > 8 || c->conv_dim % 16 || c->dv % 16) { fprintf(stderr, "qwen35: unsupported shape\n"); return -1; }
+    if ((!c->mellum && c->dk != c->dv) || c->hd > 512 || c->hd % 128 || c->n_head / c->n_head_kv > 8 || c->n_used > 16 || c->n_conv > 8 || c->conv_dim % 16 || c->dv % 16) { fprintf(stderr, "qwen35: unsupported shape\n"); return -1; }
 
     m->tok_embd = mat(g, "token_embd.weight", 0, 1);
     m->output_norm = f32(g, "output_norm.weight");
@@ -167,13 +190,14 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
             m->mtp_hnorm = f32(g, NM("nextn.hnorm.weight"));
             m->mtp_head_norm = qg_find_tensor(g, NM("nextn.shared_head_norm.weight")) ? f32(g, NM("nextn.shared_head_norm.weight")) : m->output_norm;
         } else {
-            const int rec = arr_int(g, K("attention.recurrent_layers"), l, (l + 1) % interval != 0);
+            const int rec = c->mellum ? 0 : arr_int(g, K("attention.recurrent_layers"), l, (l + 1) % interval != 0);
             L->is_attn = !rec;
+            if (c->mellum) L->is_swa = c->n_swa > 0 && arr_int(g, K("attention.sliding_window_pattern"), l, 0);
             m->attn_idx[l] = L->is_attn ? m->n_attn++ : -1;
             m->rec_idx[l] = L->is_attn ? -1 : m->n_rec++;
         }
         L->attn_norm = f32(g, NM("attn_norm.weight"));
-        L->post_norm = f32(g, NM("post_attention_norm.weight"));
+        L->post_norm = f32(g, c->mellum ? NM("ffn_norm.weight") : NM("post_attention_norm.weight"));
         if (L->is_attn) {
             L->wq = mat(g, NM("attn_q.weight"), 1, 1);
             L->wk = mat(g, NM("attn_k.weight"), 1, 1);
@@ -206,10 +230,12 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
                 free(rf);
             } else L->router_f32 = rf;
         }
-        L->shexp_gate = f32(g, NM("ffn_gate_inp_shexp.weight"));
-        L->sh_gate = mat(g, NM("ffn_gate_shexp.weight"), 1, 1);
-        L->sh_up = mat(g, NM("ffn_up_shexp.weight"), 1, 1);
-        L->sh_down = mat(g, NM("ffn_down_shexp.weight"), 1, 1);
+        if (find(g, NM("ffn_gate_shexp.weight"), 0)) {   // shared expert (Qwen; Mellum has none)
+            L->shexp_gate = f32(g, NM("ffn_gate_inp_shexp.weight"));
+            L->sh_gate = mat(g, NM("ffn_gate_shexp.weight"), 1, 1);
+            L->sh_up = mat(g, NM("ffn_up_shexp.weight"), 1, 1);
+            L->sh_down = mat(g, NM("ffn_down_shexp.weight"), 1, 1);
+        }
         L->gate_exps = mat(g, NM("ffn_gate_exps.weight"), 0, c->n_expert);
         L->up_exps = mat(g, NM("ffn_up_exps.weight"), 0, c->n_expert);
         L->down_exps = mat(g, NM("ffn_down_exps.weight"), 0, c->n_expert);
@@ -361,7 +387,7 @@ static void qin_init(qin *q, const float *x, int n, block_q8_K *kbuf, int8_t *qs
     q->qk = kbuf; q->a = (act32){qs, d, s};
 }
 static void qin_need(qin *q, int type) {
-    if (type == GT_Q8_0 || type == GT_Q5_0) {
+    if (type == GT_Q8_0 || type == GT_Q5_0 || type == GT_Q4_0 || type == GT_Q4_1) {
         if (!q->have_32) { quantize_row_a32(q->x, q->a, q->n); q->have_32 = 1; }
     } else if (!q->have_k) { quantize_row_q8_K(q->x, q->qk, q->n); q->have_k = 1; }
 }
@@ -369,6 +395,8 @@ static inline float row_dot(int type, const uint8_t *row, int n, const qin *q) {
     switch (type) {
     case GT_Q8_0: return vec_dot_q8_0_a32(n, (const block_q8_0 *)row, q->a);
     case GT_Q5_0: return vec_dot_q5_0_a32(n, (const block_q5_0 *)row, q->a);
+    case GT_Q4_0: return vec_dot_q4_0_a32(n, (const block_q4_0 *)row, q->a);
+    case GT_Q4_1: return vec_dot_q4_1_a32(n, (const block_q4_1 *)row, q->a);
     case GT_Q3_K: return vec_dot_q3_K_q8_K(n, (const block_q3_K *)row, q->qk);
     case GT_Q4_K: return vec_dot_q4_K_q8_K(n, (const block_q4_K *)row, q->qk);
     case GT_Q5_K: return vec_dot_q5_K_q8_K(n, (const block_q5_K *)row, q->qk);
@@ -545,22 +573,42 @@ static void softmax_inplace(float *x, int n) {
     const float r = 1.0f / s;
     for (int i = 0; i < n; i++) x[i] *= r;
 }
+// RoPE cos/sin for one position (NEOX pairs i, i + n_rot/2). Mellum's full-attention layers
+// use YaRN (ggml rope_yarn: interpolated/extrapolated mix per dim, cos/sin scaled by mscale).
+static void rope_cs(const q35_cfg *c, const q35_layer *L, int pos, float *cs, float *sn) {
+    const int half = c->n_rot / 2;
+    const int yarn = c->mellum && !L->is_swa && c->yarn_freq_scale > 0;
+    const float base = c->mellum && L->is_swa ? c->rope_base_swa : c->rope_base;
+    for (int i = 0; i < half; i++) {
+        const float ext = pos * powf(base, -2.0f * i / c->n_rot);
+        float th = ext, ms = 1.0f;
+        if (yarn) {
+            const float interp = c->yarn_freq_scale * ext;
+            const float y = (i - c->yarn_corr[0]) / fmaxf(0.001f, c->yarn_corr[1] - c->yarn_corr[0]);
+            const float mix = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+            th = interp * (1 - mix) + ext * mix;
+            ms = c->yarn_mscale;
+        }
+        cs[i] = cosf(th) * ms; sn[i] = sinf(th) * ms;
+    }
+}
+// first cache row a query at row S - 1 may attend to (sliding window), else 0
+static inline int attn_lo(const q35_cfg *c, const q35_layer *L, int S) {
+    return L->is_swa && S > c->n_swa ? S - c->n_swa : 0;
+}
+
 // per head: [q | gate]; q and k get an RMS norm, then RoPE (NEOX) on the first n_rot dims.
 // q goes to qh_all; k and v are written to the cache at row widx.
 static void attn_prep(const q35_model *m, const q35_layer *L, const float *qg, float *k, const float *v, float *qh_all,
                       int rpos, uint16_t *kc, uint16_t *vc, int widx) {
     const q35_cfg *c = &m->c;
     const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD;
-    const int pos = rpos;
-    const int half = c->n_rot / 2;
+    const int half = c->n_rot / 2, qs = c->gated ? 2 * HD : HD;
     float cs[256], sn[256];
-    for (int i = 0; i < half; i++) {
-        const float th = pos * powf(c->rope_base, -2.0f * i / c->n_rot);
-        cs[i] = cosf(th); sn[i] = sinf(th);
-    }
+    rope_cs(c, L, rpos, cs, sn);
     for (int h = 0; h < NH + NKV; h++) {
         float *p = h < NH ? qh_all + (size_t)h * HD : k + (size_t)(h - NH) * HD;
-        if (h < NH) memcpy(p, qg + (size_t)h * 2 * HD, HD * 4);
+        if (h < NH) memcpy(p, qg + (size_t)h * qs, HD * 4);
         rmsnorm(p, p, h < NH ? L->q_norm : L->k_norm, HD, c->eps);
         for (int i = 0; i < half; i++) {
             const float a = p[i], b = p[i + half];
@@ -574,10 +622,12 @@ static void attn_prep(const q35_model *m, const q35_layer *L, const float *qg, f
 
 // attention of the heads in qh_all over cache rows [0, S), gated by sigmoid(gate) -> ao [NH * HD]
 static void attn_core(const q35_model *m, const uint16_t *kc, const uint16_t *vc, int S, const float *qh_all,
-                      const float *qg, float *ao, scratch *s) {
+                      const float *qg, float *ao, scratch *s, int lo) {
     const q35_cfg *c = &m->c;
     const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD, gqa = NH / NKV;
     const float scale = 1.0f / sqrtf((float)HD);
+    // sliding window: attend over rows [lo, S) only (shift the bases, keep the row math)
+    kc += (size_t)lo * kvd; vc += (size_t)lo * kvd; S -= lo;
     // time-blocked: each K/V row is read once for all heads that share it
     const int NBLK = S < 256 ? 1 : (S / 256 < 32 ? S / 256 : 32), bs = (S + NBLK - 1) / NBLK;
     static float *part;
@@ -629,8 +679,10 @@ static void attn_core(const q35_model *m, const uint16_t *kc, const uint16_t *vc
             for (int bk = 0; bk < NBLK; bk++) acc = _mm512_add_ps(acc, _mm512_loadu_ps(part + ((size_t)bk * NH + h) * HD + i));
             _mm512_storeu_ps(o + i, acc);
         }
-        const float *gate = qg + (size_t)h * 2 * HD + HD;
-        for (int i = 0; i < HD; i++) o[i] *= sigmoidf(gate[i]);
+        if (c->gated) {
+            const float *gate = qg + (size_t)h * 2 * HD + HD;
+            for (int i = 0; i < HD; i++) o[i] *= sigmoidf(gate[i]);
+        }
     }
 }
 
@@ -646,7 +698,7 @@ static void attention(q35_model *m, const q35_layer *L, uint16_t *kc, uint16_t *
     mv_multi(jobs, 3, &q);
     attn_prep(m, L, qg, k, v, s->big, rpos, kc, vc, widx);
     float *ao = s->t2 + kvd;   // after k: NH*HD floats fit (t2 has max(conv_dim, 2*NH*HD))
-    attn_core(m, kc, vc, S, s->big, qg, ao, s);
+    attn_core(m, kc, vc, S, s->big, qg, ao, s, attn_lo(c, L, S));
     qin q2;
     qin_init(&q2, ao, c->n_head * c->hd, s->qk2, s->a_qs2, s->a_d2, s->a_s2);
     mv_job j2 = {&L->wo, out};
@@ -691,6 +743,8 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
     t0 = qnow();
     qin q;
     qin_init(&q, xn, D, s->qk, s->a_qs, s->a_d, s->a_s);
+    if (!L->sh_gate.data) memset(out, 0, D * 4);
+    else {
     float *sg = s->t1, *su = s->t2;
     mv_job jobs[2] = {{&L->sh_gate, sg}, {&L->sh_up, su}};
     mv_multi(jobs, 2, &q);
@@ -701,6 +755,7 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
     mv_multi(&jd, 1, &q2);
     const float shg = sigmoidf(dotf(L->shexp_gate, xn, D));
     for (int i = 0; i < D; i++) out[i] *= shg;
+    }
     q35_prof[4] += qnow() - t0;
 
     // routed experts: everything already in RAM as one batch, then the rest as they arrive
@@ -984,7 +1039,7 @@ static void attention2(q35_model *m, const q35_layer *L, int ai, const float *xn
     uint16_t *kc = kc_layer(m, ai), *vc = vc_layer(m, ai);
     scratch *ss[2] = {s0, s1};
     for (int t = 0; t < 2; t++) attn_prep(m, L, ss[t]->t1, ss[t]->t2, ss[t]->t3, ss[t]->big, pos + t, kc, vc, pos + t);
-    for (int t = 0; t < 2; t++) attn_core(m, kc, vc, pos + t + 1, ss[t]->big, ss[t]->t1, ss[t]->t2 + kvd, s0);
+    for (int t = 0; t < 2; t++) attn_core(m, kc, vc, pos + t + 1, ss[t]->big, ss[t]->t1, ss[t]->t2 + kvd, s0, attn_lo(&m->c, L, pos + t + 1));
     qin p0, p1;
     qin_init(&p0, s0->t2 + kvd, c->n_head * c->hd, s0->qk2, s0->a_qs2, s0->a_d2, s0->a_s2);
     qin_init(&p1, s1->t2 + kvd, c->n_head * c->hd, s1->qk2, s1->a_qs2, s1->a_d2, s1->a_s2);
@@ -1382,7 +1437,8 @@ static inline void dot2x4_s8(int n, const q3k_s8 *w0, const q3k_s8 *w1, const ui
 
 static void mm_any(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
                    const float *X, int ldx, int T, float *Y, int ldy) {
-    const int k = type == GT_Q3_K || type == GT_Q4_K || type == GT_Q5_K || type == GT_Q6_K;
+    const int k = type == GT_Q3_K || type == GT_Q4_K || type == GT_Q5_K || type == GT_Q6_K ||
+                  type == GT_Q4_0 || type == GT_Q4_1 || type == GT_Q8_0;
     if (k && cols % QK_K == 0 && !getenv("QUARRY_PF_F32")) mm_q3k_s8(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
     else mm_f32(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
 }
@@ -1507,7 +1563,7 @@ static void pf_delta_net(q35_model *m, const q35_layer *L, int ri, q35_pfbuf *b,
 static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b, int T, int pos0) {
     const q35_cfg *c = &m->c;
     const int D = c->n_embd, HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD, gqa = NH / NKV;
-    const int QD = NH * HD * 2;
+    const int QS = c->gated ? 2 * HD : HD, QD = NH * QS;
     float *QG = b->A, *K = b->B, *V = b->C, *AO = b->O;
     mm(&L->wq, b->XN, D, T, QG, QD);
     mm(&L->wk, b->XN, D, T, K, kvd);
@@ -1518,13 +1574,10 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
     for (int t = 0; t < T; t++) {
         const int pos = pos0 + t;
         float cs[256], sn[256];
-        for (int i = 0; i < half; i++) {
-            const float th = pos * powf(c->rope_base, -2.0f * i / c->n_rot);
-            cs[i] = cosf(th); sn[i] = sinf(th);
-        }
+        rope_cs(c, L, pos, cs, sn);
         float *qg = QG + (size_t)t * QD, *k = K + (size_t)t * kvd;
         for (int h = 0; h < NH + NKV; h++) {
-            float *p = h < NH ? qg + (size_t)h * 2 * HD : k + (size_t)(h - NH) * HD;   // q in place, gate after it
+            float *p = h < NH ? qg + (size_t)h * QS : k + (size_t)(h - NH) * HD;   // q in place, gate after it
             rmsnorm(p, p, h < NH ? L->q_norm : L->k_norm, HD, c->eps);
             for (int i = 0; i < half; i++) {
                 const float a = p[i], bb = p[i + half];
@@ -1551,14 +1604,15 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
             const int tq0 = qb * QB, tq1 = tq0 + QB < T ? tq0 + QB : T, nt = tq1 - tq0;
             const int S = pos0 + tq1;                                   // keys needed by the last query
             const float *qp[64];
-            int qpos[64];
+            int qpos[64], qlo[64];
             for (int a = 0; a < nt; a++)
                 for (int g = 0; g < gqa; g++) {
-                    qp[a * gqa + g] = QG + (size_t)(tq0 + a) * QD + (size_t)(kvh * gqa + g) * 2 * HD;
+                    qp[a * gqa + g] = QG + (size_t)(tq0 + a) * QD + (size_t)(kvh * gqa + g) * QS;
                     qpos[a * gqa + g] = pos0 + tq0 + a;
+                    qlo[a * gqa + g] = attn_lo(c, L, pos0 + tq0 + a + 1);   // sliding window start
                 }
-            const int nq = nt * gqa;
-            for (int kb = 0; kb < S; kb += KB) {
+            const int nq = nt * gqa, kstart = qlo[0] / KB * KB;          // first query has the lowest start
+            for (int kb = kstart; kb < S; kb += KB) {
                 const int ke = kb + KB < S ? kb + KB : S;
                 for (int k = kb; k < ke; k++)
                     for (int i = 0; i < HD; i += 16)
@@ -1566,7 +1620,7 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                 for (int q = 0; q < nq; q++) {
                     const int lim = qpos[q] + 1 < ke ? qpos[q] + 1 : ke;
                     float *aq = att + (size_t)q * S_all;
-                    for (int k = kb; k < lim; k++) {
+                    for (int k = kb > qlo[q] ? kb : qlo[q]; k < lim; k++) {
                         const float *kr = Kf + (size_t)(k - kb) * HD;
                         __m512 a0 = _mm512_setzero_ps(), a1 = a0;
                         for (int i = 0; i < HD; i += 32) {
@@ -1577,9 +1631,9 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                     }
                 }
             }
-            for (int q = 0; q < nq; q++) softmax_inplace(att + (size_t)q * S_all, qpos[q] + 1);
+            for (int q = 0; q < nq; q++) softmax_inplace(att + (size_t)q * S_all + qlo[q], qpos[q] + 1 - qlo[q]);
             memset(acc, 0, (size_t)nq * HD * 4);
-            for (int kb = 0; kb < S; kb += KB) {
+            for (int kb = kstart; kb < S; kb += KB) {
                 const int ke = kb + KB < S ? kb + KB : S;
                 for (int k = kb; k < ke; k++)
                     for (int i = 0; i < HD; i += 16)
@@ -1591,7 +1645,7 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                     for (int i0 = 0; i0 < HD; i0 += 128) {
                         __m512 r[8];
                         for (int j = 0; j < 8; j++) r[j] = _mm512_loadu_ps(o + i0 + 16 * j);
-                        for (int k = kb; k < lim; k++) {
+                        for (int k = kb > qlo[q] ? kb : qlo[q]; k < lim; k++) {
                             const __m512 a = _mm512_set1_ps(aq[k]);
                             const float *vr = Vf + (size_t)(k - kb) * HD + i0;
                             for (int j = 0; j < 8; j++) r[j] = _mm512_fmadd_ps(a, _mm512_load_ps(vr + 16 * j), r[j]);
@@ -1605,7 +1659,7 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                     const int q = a * gqa + g, h = kvh * gqa + g;
                     float *o = AO + (size_t)(tq0 + a) * NH * HD + (size_t)h * HD;
                     const float *gate = qp[q] + HD;
-                    for (int i = 0; i < HD; i++) o[i] = acc[(size_t)q * HD + i] * sigmoidf(gate[i]);
+                    for (int i = 0; i < HD; i++) o[i] = c->gated ? acc[(size_t)q * HD + i] * sigmoidf(gate[i]) : acc[(size_t)q * HD + i];
                 }
         }
         free(att); free(Kf); free(Vf); free(acc);
@@ -1619,6 +1673,8 @@ static void pf_moe(q35_model *m, int l, q35_pfbuf *b, int T) {
     const int D = c->n_embd, K = c->n_used, F = c->n_ff, FS = c->n_ff_sh, NE = c->n_expert;
     double tm = qnow();
     // shared expert for all tokens
+    if (!L->sh_gate.data) memset(b->R, 0, (size_t)T * D * 4);
+    else {
     mm(&L->sh_gate, b->XN, D, T, b->G, FS);
     mm(&L->sh_up, b->XN, D, T, b->H, FS);
     silu_mul(b->G, b->H, (size_t)T * FS);
@@ -1628,6 +1684,7 @@ static void pf_moe(q35_model *m, int l, q35_pfbuf *b, int T) {
         const float sg = sigmoidf(dotf(L->shexp_gate, b->XN + (size_t)t * D, D));
         float *r = b->R + (size_t)t * D;
         for (int i = 0; i < D; i++) r[i] *= sg;
+    }
     }
     q35_mp[0] += qnow() - tm; tm = qnow();
     // routing per token (router dots are parallel inside route(); tokens one after another)
