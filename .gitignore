@@ -1,0 +1,8 @@
+quarry/build/
+research/matvec_bench
+research/trace
+research/gen.txt
+research/route_trace.txt
+quarry/tests/*.f32
+quarry/tests/*.logits
+quarry/tests/*.ids
