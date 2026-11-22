@@ -284,7 +284,7 @@ const now = () => Date.now();
 function conv() { return convs.find(c => c.id === cur); }
 let save = function () { store.set("convs", convs.slice(0, 200)); store.set("cur", cur); };
 function newChat() {
-  if (busy) busy.abort();
+  stopGen();
   cur = null; save(); renderSide(); renderMsgs(); closeSide();
   if (matchMedia("(min-width: 861px)").matches) $("in").focus();
 }
@@ -351,7 +351,8 @@ function fillAsst(d, m, live, isLast) {
   if (m.think) h += '<details class="think"><summary>' + (live && !m.content ? "Thinking…" : "Thought it through") + '</summary><div class="tx"></div></details>';
   if (m.content) h += md(m.content.replace(/^\n+/, ""));
   else if (live && !m.think) h += '<div class="status"><span class="dot busy"></span>' + esc(m.status || "Reading your message…") + "</div>";
-  if (live && m.content) h += '<span class="cursor"></span>';
+  if (live && m.recovering) h += '<div class="status"><span class="dot busy"></span>Connection dropped (phone asleep?). The server is still writing; the reply appears when it\'s done…</div>';
+  else if (live && m.content) h += '<span class="cursor"></span>';
   if (m.error) h += '<div class="err">' + esc(m.error) + "</div>";
   if (!live && m.meta) h += '<div class="meta"><span>' + esc(m.meta) + '</span><button data-copyall>Copy</button>' + (isLast ? '<button data-regen>Retry</button>' : "") + "</div>";
   body.innerHTML = h;
@@ -404,8 +405,10 @@ async function send(text) {
   const m = {role: "assistant", content: "", think: "", status: "Reading your message…"};
   const el = msgEl(m, true); fillAsst(el, m, true); $("msgs").appendChild(el); stick = true; scrollDown(true);
   const ctl = new AbortController(); setBusy(ctl);
+  const job = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  ctl.job = job;
   const t0 = performance.now();
-  let tFirst = 0, ntok = 0, usage = null, last = 0;
+  let tFirst = 0, ntok = 0, usage = null, last = 0, finished = false;
   const tick = setInterval(() => {
     if (!tFirst) { m.status = "Reading your message… " + ((performance.now() - t0) / 1000).toFixed(0) + "s"; fillAsst(el, m, true); }
   }, 1000);
@@ -417,7 +420,7 @@ async function send(text) {
     const r = await fetch("v1/chat/completions", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: ctl.signal,
       body: JSON.stringify({model: "quarry", stream: true, temperature: settings.temp, max_tokens: settings.max,
-                            chat_template_kwargs: {enable_thinking: settings.think}, messages: msgs})
+                            chat_template_kwargs: {enable_thinking: settings.think}, quarry_job: job, messages: msgs})
     });
     if (!r.ok) throw new Error("The server answered " + r.status);
     const rd = r.body.getReader(), dec = new TextDecoder();
@@ -431,7 +434,7 @@ async function send(text) {
         const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
         if (!line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
+        if (data === "[DONE]") { finished = true; continue; }
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.usage) usage = j.usage;
         const dl = j.choices && j.choices[0] && j.choices[0].delta;
@@ -444,21 +447,47 @@ async function send(text) {
         draw();
       }
     }
-  } catch (e) {
-    if (e.name !== "AbortError") m.error = String(e.message || e) + " (is the Quarry server running?)";
-  }
+  } catch (e) { /* stream lost (phone asleep, network change): recovered below */ }
   clearInterval(tick);
-  const gen = usage ? usage.completion_tokens : ntok, secs = tFirst ? (performance.now() - tFirst) / 1000 : 0;
+  let gen = usage ? usage.completion_tokens : ntok, secs = tFirst ? (performance.now() - tFirst) / 1000 : 0, pr = tFirst ? (tFirst - t0) / 1000 : 0;
+  if (!finished && !ctl.signal.aborted) {
+    // the server keeps generating when the connection drops; fetch the finished reply
+    const r = await recover(job, m, el);
+    if (r) { m.content = r.content; m.think = r.reasoning; gen = r.gen_tokens; secs = r.gen_s; pr = r.prompt_s; }
+    else if (!ctl.signal.aborted) m.error = "Lost the connection to the Quarry server and couldn't get the reply. Press Retry.";
+  }
   m.meta = gen + " tokens" + (secs > 0 ? " · " + (gen / secs).toFixed(1) + " tok/s" : "") +
-           (tFirst ? " · prompt " + ((tFirst - t0) / 1000).toFixed(1) + "s" : "") + (ctl.signal.aborted ? " · stopped" : "");
+           (pr ? " · prompt " + pr.toFixed(1) + "s" : "") + (ctl.signal.aborted ? " · stopped" : "");
   if (secs > 0) $("cgen").innerHTML = "<b>" + (gen / secs).toFixed(1) + "</b> tok/s";
   if (!m.content && !m.think && !m.error) m.content = "*(no reply)*";
-  delete m.status;
+  delete m.status; delete m.recovering;
   c.msgs.push(m); c.t = now(); save();
   fillAsst(el, m, false, true);
   setBusy(null);
   scrollDown();
   stats();
+}
+
+async function recover(job, m, el) {
+  m.recovering = true; fillAsst(el, m, true);
+  const until = Date.now() + 30 * 60e3;
+  while (Date.now() < until) {
+    if (busy && busy.signal.aborted) return null;
+    if (document.visibilityState === "visible") {
+      try {
+        const r = await fetch("v1/job?id=" + job, {cache: "no-store"});   // answered once the reply is finished
+        if (r.ok) return await r.json();
+        if (r.status === 404) return null;
+      } catch (e) {}
+    }
+    await new Promise(res => setTimeout(res, 3000));
+  }
+  return null;
+}
+function stopGen() {   // tell the server to stop (a dropped stream alone doesn't: it finishes for a sleeping phone)
+  if (!busy) return;
+  fetch("v1/cancel?id=" + busy.job, {method: "POST", cache: "no-store"}).catch(() => {});
+  busy.abort();
 }
 
 // ---------- engine stats ----------
@@ -511,7 +540,7 @@ $("in").addEventListener("keydown", e => {
 });
 $("send").onclick = submit;
 function submit() {
-  if (busy) { busy.abort(); return; }
+  if (busy) { stopGen(); return; }
   const t = $("in").value.trim(); if (!t) return;
   $("in").value = ""; $("in").style.height = ""; $("send").disabled = true;
   send(t);

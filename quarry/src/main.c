@@ -11,6 +11,9 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
+#include <poll.h>
+#include <ctype.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -33,11 +36,17 @@ typedef struct {
     ink_model im;
     q35_model qm;
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
-    int (*reason_emit)(const char *, void *);
+    int (*reason_emit)(const char *, void *);   // if set: thinking text goes here (HTTP reasoning_content)
     char model_name[256];              // GGUF file name, shown by the chat page
     int last_prompt, last_gen;         // last request: tokens and seconds (for /v1/stats)
     double last_t_prompt, last_t_gen;
-    long n_requests;   // if set: thinking text goes here (HTTP reasoning_content)
+    long n_requests;
+    // server: connections that arrive during a generation wait here (handled after it), and the
+    // last reply of a chat-page request is kept so the page can fetch it after losing the stream
+    int listen_fd, pend_fd[32], n_pend;
+    char job_id[64], *job_content, *job_reason, job_finish[16];
+    int job_prompt_tokens, job_gen_tokens, job_cancelled;
+    double job_t_prompt, job_t_gen;
     int t_think_end, think, think_default;   // q35: "</think>" token; thinking on for this request / by default
     // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
     int t_think, t_text, t_end_msg, t_msg_model, mode, show_thinking;
@@ -846,7 +855,46 @@ static void send_all(int fd, const char *b, size_t n) {
 }
 
 typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent; int in_call;
-                 char pend[2][8]; int npend[2]; } req_ctx;   // pend: an incomplete UTF-8 character per field
+                 char pend[2][8]; int npend[2];   // pend: an incomplete UTF-8 character per field
+                 engine *e; char job[64];          // job: chat-page id; then generation continues if the client goes away
+                 char *racc; size_t racc_len, racc_cap; int cancelled; } req_ctx;
+
+static void acc_add(char **b, size_t *len, size_t *cap, const char *t, size_t l) {
+    if (*len + l + 1 > *cap) *b = realloc(*b, *cap = (*cap + l) * 2 + 64);
+    memcpy(*b + *len, t, l);
+    *len += l;
+    (*b)[*len] = 0;
+}
+
+// called between tokens: take connections that arrived meanwhile. A cancel for this request stops
+// it; anything else waits in e->pend_fd until the generation ends.
+static int serve_poll(req_ctx *r) {
+    engine *e = r->e;
+    if (!e || e->listen_fd <= 0) return 0;
+    struct pollfd p = {e->listen_fd, POLLIN, 0};
+    while (e->n_pend < 32 && poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) {
+        int c = accept(e->listen_fd, NULL, NULL);
+        if (c < 0) break;
+        struct timeval tv = {0, 500000};
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char b[512] = {0};
+        ssize_t n = recv(c, b, sizeof b - 1, MSG_PEEK);
+        char method[8] = {0}, path[256] = {0};
+        if (n > 0) sscanf(b, "%7s %255s", method, path);
+        if (!strncmp(path, "/v1/cancel", 10)) {
+            const char *id = strstr(path, "id=");
+            if (!id || !r->job[0] || !strcmp(id + 3, r->job)) r->cancelled = 1;
+            const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+            send(c, resp, strlen(resp), MSG_NOSIGNAL);
+            close(c);
+        } else {
+            tv.tv_usec = 0; tv.tv_sec = 30;
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            e->pend_fd[e->n_pend++] = c;
+        }
+    }
+    return r->cancelled;
+}
 
 // length of the longest prefix of s[0..n) that does not end inside a UTF-8 character
 static size_t utf8_complete(const char *s, size_t n) {
@@ -858,6 +906,7 @@ static size_t utf8_complete(const char *s, size_t n) {
     return need > k + 1 ? i - 1 : n;
 }
 static int send_delta_field(req_ctx *r, const char *field, const char *t0, size_t n0) {
+    if (r->broken) return !r->job[0];   // client gone: a chat-page request keeps generating
     // token pieces can split a multi-byte character: send complete characters only
     const int fi = field[0] == 'r';
     char *t = malloc(n0 + 8);
@@ -881,13 +930,15 @@ static int send_delta_field(req_ctx *r, const char *field, const char *t0, size_
     int bad = send(r->fd, msg, len, MSG_NOSIGNAL) <= 0;
     free(tmp); free(esc); free(msg);
     if (bad) r->broken = 1;
-    return bad;
+    return bad && !r->job[0];
 }
 
 static int send_delta(req_ctx *r, const char *t, size_t n) { return send_delta_field(r, "content", t, n); }
 // thinking text, streamed as reasoning_content (keeps bytes flowing through proxies too)
 static int emit_reason_http(const char *t, void *ud) {
     req_ctx *r = ud;
+    acc_add(&r->racc, &r->racc_len, &r->racc_cap, t, strlen(t));
+    if (serve_poll(r)) return 1;
     return r->stream ? send_delta_field(r, "reasoning_content", t, strlen(t)) : 0;
 }
 
@@ -898,6 +949,7 @@ static int emit_http(const char *t, void *ud) {
     memcpy(r->acc + r->acc_len, t, l);
     r->acc_len += l;
     r->acc[r->acc_len] = 0;
+    if (serve_poll(r)) return 1;
     if (!r->stream || r->in_call) return 0;
     if (!r->tools) { size_t n = r->acc_len - r->sent; r->sent = r->acc_len; return send_delta(r, r->acc + r->acc_len - n, n); }
     // tools on: never stream the <tool_call> markup; hold back a possible start of it
@@ -959,6 +1011,33 @@ static void handle(engine *e, int fd) {
         const char *b = "{\"status\":\"ok\"}";
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
         send_all(fd, hdr, n);
+    } else if (!strncmp(path, "/v1/cancel", 10)) {
+        // nothing running (a cancel during a generation is taken by serve_poll)
+        const char *b = "{\"ok\":true}";
+        int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
+        send_all(fd, hdr, n);
+    } else if (!strncmp(path, "/v1/job", 7)) {
+        // the kept reply of a chat-page request (requests are served in order, so it is finished)
+        const char *id = strstr(path, "id=");
+        if (!id || !e->job_content || strcmp(id + 3, e->job_id)) {
+            const char *b = "{\"error\":\"unknown job\"}";
+            int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
+            send_all(fd, hdr, n);
+        } else {
+            size_t lc = strlen(e->job_content), lr = strlen(e->job_reason);
+            char *ec = malloc(lc * 6 + 16), *er = malloc(lr * 6 + 16);
+            json_escape(e->job_content, ec, lc * 6 + 16);
+            json_escape(e->job_reason, er, lr * 6 + 16);
+            size_t cap = strlen(ec) + strlen(er) + 512;
+            char *b = malloc(cap);
+            int bl = snprintf(b, cap, "{\"id\":\"%s\",\"done\":true,\"finish_reason\":\"%s\",\"content\":\"%s\",\"reasoning\":\"%s\","
+                              "\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}",
+                              e->job_id, e->job_finish, ec, er, e->job_prompt_tokens, e->job_t_prompt, e->job_gen_tokens, e->job_t_gen);
+            int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
+            send_all(fd, hdr, n);
+            send_all(fd, b, bl);
+            free(ec); free(er); free(b);
+        }
     } else if (!strcmp(path, "/v1/stats")) {
         // engine state for the chat page: model, context, expert cache, speculation, last request
         struct expert_store *es = eng_experts(e);
@@ -1019,6 +1098,9 @@ static void handle(engine *e, int fd) {
                      : e->q35 ? chat_q35(roles, contents, tcalls, nm, tools, think)
                      : chat_qwen(roles, contents, tcalls, nm, tools);
         req_ctx rc = {fd, stream, calloc(1, 1), 0, 1, 0, (long)time(NULL), tools != NULL && !e->ink, 0, 0};
+        rc.e = e;
+        if ((v = json_get(body, "quarry_job"))) { char *j = json_str(skip_ws(v), NULL); if (j) { snprintf(rc.job, sizeof rc.job, "%s", j); free(j); } }
+        for (char *c = rc.job; *c; c++) if (!isalnum((unsigned char)*c)) *c = '_';
         if (stream) {
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%s\r\n", cors);
             send_all(fd, hdr, n);
@@ -1032,7 +1114,17 @@ static void handle(engine *e, int fd) {
         e->n_requests++;
         fprintf(stderr, "[req: %d msgs, %d prompt tok (%.1fs), %d gen tok, %.2f tok/s]\n", nm, st.prompt_tokens,
                 st.t_prompt, st.gen_tokens, st.gen_tokens / (st.t_gen > 0 ? st.t_gen : 1));
-        const char *finish = st.gen_tokens >= max_tokens ? "length" : "stop";
+        const char *finish = rc.cancelled ? "cancelled" : st.gen_tokens >= max_tokens ? "length" : "stop";
+        if (rc.job[0]) {   // keep the reply for GET /v1/job
+            snprintf(e->job_id, sizeof e->job_id, "%s", rc.job);
+            free(e->job_content); free(e->job_reason);
+            e->job_content = strdup(rc.acc);
+            e->job_reason = strdup(rc.racc ? rc.racc : "");
+            snprintf(e->job_finish, sizeof e->job_finish, "%s", finish);
+            e->job_prompt_tokens = st.prompt_tokens; e->job_gen_tokens = st.gen_tokens;
+            e->job_t_prompt = st.t_prompt; e->job_t_gen = st.t_gen; e->job_cancelled = rc.cancelled;
+            if (rc.broken) fprintf(stderr, "[client left during the reply; kept for /v1/job?id=%s]\n", rc.job);
+        }
         size_t content_len = rc.acc_len;
         char *calls = rc.tools ? parse_tool_calls(rc.acc, tools, rc.id, &content_len) : NULL;
         if (calls) finish = "tool_calls";
@@ -1077,6 +1169,7 @@ static void handle(engine *e, int fd) {
         free(calls);
         free(prompt);
         free(rc.acc);
+        free(rc.racc);
         for (int i = 0; i < nm; i++) { free((void *)roles[i]); free((void *)contents[i]); }
     } else {
         const char *b = "{\"error\":\"not found\"}";
@@ -1095,9 +1188,13 @@ static int cmd_serve(engine *e, const char *host, int port) {
     inet_pton(AF_INET, host, &a.sin_addr);
     if (bind(s, (struct sockaddr *)&a, sizeof a) || listen(s, 16)) { perror("bind"); return 1; }
     fprintf(stderr, "quarry: serving OpenAI-compatible API on http://%s:%d/v1\n", host, port);
+    e->listen_fd = s;
     for (;;) {
-        int c = accept(s, NULL, NULL);
-        if (c < 0) continue;
+        int c;
+        if (e->n_pend) {   // connections that arrived during the last generation, oldest first
+            c = e->pend_fd[0];
+            memmove(e->pend_fd, e->pend_fd + 1, --e->n_pend * sizeof(int));
+        } else if ((c = accept(s, NULL, NULL)) < 0) continue;
         handle(e, c);
         close(c);
     }
