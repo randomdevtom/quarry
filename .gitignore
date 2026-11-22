@@ -12,3 +12,4 @@ research/results/
 research/__pycache__/
 research/trace_vendor
 __pycache__/
+quarry/src/chat_html.h

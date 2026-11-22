@@ -20,6 +20,7 @@
 #include "inkling.h"
 #include "model.h"
 #include "qwen35.h"
+#include "chat_html.h"   // generated from src/chat.html by the Makefile
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
@@ -914,6 +915,11 @@ static void handle(engine *e, int fd) {
     if (!strcmp(method, "OPTIONS")) {
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 204 No Content\r\n%sContent-Length: 0\r\n\r\n", cors);
         send_all(fd, hdr, n);
+    } else if (!strcmp(method, "GET") && (!strcmp(path, "/") || !strcmp(path, "/chat"))) {
+        // built-in chat page (src/chat.html)
+        int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-cache\r\nContent-Length: %u\r\n\r\n", src_chat_html_len);
+        send_all(fd, hdr, n);
+        send_all(fd, (const char *)src_chat_html, src_chat_html_len);
     } else if (!strcmp(path, "/health")) {
         const char *b = "{\"status\":\"ok\"}";
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);

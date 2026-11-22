@@ -12,7 +12,10 @@ CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/q
 
 all: build/quarry build/quarry-bench build/quarry-info
 
-build/quarry: $(CORE) src/main.c src/*.h
+src/chat_html.h: src/chat.html
+	xxd -i $< > $@
+
+build/quarry: $(CORE) src/main.c src/*.h src/chat_html.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(CORE) src/main.c -o $@ $(LDLIBS) $(LLAMA_LIBS)
 
