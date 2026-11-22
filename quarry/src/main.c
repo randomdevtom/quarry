@@ -866,6 +866,8 @@ static void acc_add(char **b, size_t *len, size_t *cap, const char *t, size_t l)
     (*b)[*len] = 0;
 }
 
+static void handle(engine *e, int fd);
+
 // called between tokens: take connections that arrived meanwhile. A cancel for this request stops
 // it; anything else waits in e->pend_fd until the generation ends.
 static int serve_poll(req_ctx *r) {
@@ -886,6 +888,13 @@ static int serve_poll(req_ctx *r) {
             if (!id || !r->job[0] || !strcmp(id + 3, r->job)) r->cancelled = 1;
             const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
             send(c, resp, strlen(resp), MSG_NOSIGNAL);
+            close(c);
+        } else if (!strcmp(method, "GET") && strncmp(path, "/v1/job", 7)) {
+            // the page, health, stats, models: answer now (they don't generate) so the site
+            // still opens while a long reply is being written
+            tv.tv_usec = 0; tv.tv_sec = 5;
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            handle(e, c);
             close(c);
         } else {
             tv.tv_usec = 0; tv.tv_sec = 30;
