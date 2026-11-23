@@ -106,7 +106,9 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     // (Qwen3-Coder 19/21, Qwen3.8 distill 20/21), 10-25% faster. `--experts 8` restores the exact model.
     int is_mellum = 0;
     { qg_file g; if (!qg_open(&g, path)) { const char *a = qg_get_str(&g, "general.architecture"); is_mellum = a && !strcmp(a, "mellum"); qg_close(&g); } }
-    if (!e->ink && !is_mellum && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);   // Mellum: untested at 6, keep 8
+    // Qwen3.5/3.6/3.8 (and Mellum) run all 8: at 6 the Qwen3.8 distill fell into a "..." loop on a
+    // short chat turn that the exact model answers normally. `--experts 6` is still available.
+    if (!e->ink && !is_mellum && !e->q35 && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (e->q35) {
         if (q35_load(&e->qm, path, n_ctx)) return -1;
         e->snap = malloc(q35_state_bytes(&e->qm));
@@ -1326,6 +1328,7 @@ static void handle(engine *e, int fd) {
                 if (*v != '{') break;
                 const char *r = json_get(v, "role"), *c = json_get(v, "content");
                 roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
+                if (!strcmp(roles[nm], "developer")) { free((char *)roles[nm]); roles[nm] = strdup("system"); }   // OpenAI's newer name for system
                 contents[nm] = c ? content_text(c) : strdup("");
                 tcalls[nm] = json_get(v, "tool_calls");
                 nm++;
@@ -1462,7 +1465,7 @@ static void usage(void) {
             "  quarry serve -m model.gguf [--host 127.0.0.1] [--port 8090] [-c ctx]\n"
             "  models: Qwen3-MoE (qwen3moe), Inkling 2 (inkling2_loop; --effort 0..0.99 thinking, default 0.2)\n"
             "  --skip 0.1   Inkling, lossy: skip experts not in RAM whose routing weight is < 10%% (faster, output changes)\n"
-            "  --experts N  Qwen3-MoE experts per token (default 6 of 8; 8 = exact model)\n\n"
+            "  --experts N  experts per token (default: 6 of 8 for Qwen3-Coder, all 8 otherwise; fewer = faster, lossy)\n\n"
             "env: QUARRY_CACHE_GB (expert cache, default 5.5)  QUARRY_IO_THREADS (default 2)\n");
 }
 
@@ -1476,6 +1479,12 @@ static int cmd_bench_prefill(engine *e, const char *path) {
     fclose(f);
     int *toks = malloc(sizeof(int) * e->n_ctx);
     int n = tokenize(e, text, toks, e->n_ctx);
+    if (getenv("QUARRY_IDS")) {   // token ids from a file (one per line), e.g. tests/ref_logits output
+        FILE *fi = fopen(getenv("QUARRY_IDS"), "r");
+        n = 0;
+        while (fi && n < e->n_ctx && fscanf(fi, "%d", &toks[n]) == 1) n++;
+        if (fi) fclose(fi);
+    }
     if (n <= 0 || n >= e->n_ctx) { fprintf(stderr, "prompt has %d tokens, ctx %d\n", n, e->n_ctx); return 1; }
     for (int run = 0; run < 2; run++) {
         memset(qt_pf, 0, sizeof qt_pf);
@@ -1488,8 +1497,25 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         printf("%s: %d tokens in %.1fs = %.1f tok/s | SSD %.2f GB | attn mm %.1fs, attn %.1fs, route %.1fs, experts %.1fs (io wait %.1fs, gate+up %.1fs, down %.1fs)\n",
                run ? "warm" : "cold", n, dt, n / dt, (bytes_read(e) - b0) / 1e9,
                qt_pf[0], qt_pf[1], qt_pf[2], qt_pf[3], qt_pf[4], qt_pf[5], qt_pf[6]);
-        if (e->q35) printf("  q35: delta-net %.1fs (proj %.1fs, conv+norm %.1fs, recur %.1fs), attention %.1fs, moe %.1fs\n", q35_prof[0], q35_prof[6], q35_prof[7], q35_prof[4], q35_prof[1], q35_prof[3]);
+        if (e->q35) printf("  q35: delta-net %.1fs (proj %.1fs, conv+norm %.1fs, recur %.1fs), attention %.1fs (core %.1fs), moe %.1fs\n", q35_prof[0], q35_prof[6], q35_prof[7], q35_prof[4], q35_prof[1], q35_mp[7], q35_prof[3]);
         if (e->q35) printf("  moe: shared %.1fs, route %.1fs, cached experts %.1fs, streamed %.1fs, stream wait %.1fs | repack (thread 0) q3k %.1fs, other %.1fs\n", q35_mp[0], q35_mp[1], q35_mp[2], q35_mp[3], q35_mp[4], q35_mp[5], q35_mp[6]);
+    }
+    if (getenv("QUARRY_CHECK") && e->q35) {
+        // compare the batched path's last logits with the token-by-token path's
+        const int nv = n_vocab(e);
+        float *ref = malloc(sizeof(float) * nv);
+        q35_state_reset(&e->qm); e->n_ctx_tokens = 0; e->snap_pos = 0;
+        memcpy(ref, q35_prefill(&e->qm, toks, n, 0), sizeof(float) * nv);
+        if (getenv("QUARRY_DUMP")) { FILE *df = fopen(getenv("QUARRY_DUMP"), "wb"); if (df) { fwrite(ref, sizeof(float), nv, df); fclose(df); } }
+        if (getenv("QUARRY_DUMP_ONLY")) { free(ref); free(toks); return 0; }
+        setenv("QUARRY_PER_TOKEN", "1", 1);
+        q35_state_reset(&e->qm);
+        const float *lg = q35_prefill(&e->qm, toks, n, 0);
+        double dot = 0, na = 0, nb = 0; int ia = 0, ib = 0;
+        for (int i = 0; i < nv; i++) { dot += (double)ref[i] * lg[i]; na += (double)ref[i] * ref[i]; nb += (double)lg[i] * lg[i];
+                                       if (ref[i] > ref[ia]) ia = i; if (lg[i] > lg[ib]) ib = i; }
+        printf("check: batched vs per-token cosine %.5f, top token %d / %d\n", dot / sqrt(na * nb), ia, ib);
+        free(ref);
     }
     free(toks);
     return 0;
@@ -1529,6 +1555,7 @@ static int cmd_debug_tools(int argc, char **argv) {
             if (*v != '{') break;
             const char *r = json_get(v, "role"), *c = json_get(v, "content");
             roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
+                if (!strcmp(roles[nm], "developer")) { free((char *)roles[nm]); roles[nm] = strdup("system"); }   // OpenAI's newer name for system
             contents[nm] = c ? content_text(c) : strdup("");
             tcalls[nm] = json_get(v, "tool_calls");
             nm++;

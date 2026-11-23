@@ -486,6 +486,50 @@ static void route(const q35_layer *L, const float *xn, const q35_cfg *c, int k, 
     for (int j = 0; j < k; j++) w[j] /= ws;
 }
 
+// top-k of one token's router logits (softmax over all experts, renormalized over the k)
+static void route_pick(float *rl, int ne, int k, int *sel, float *w) {
+    float mx = rl[0];
+    for (int e = 1; e < ne; e++) if (rl[e] > mx) mx = rl[e];
+    for (int e = 0; e < ne; e++) rl[e] = expf(rl[e] - mx);
+    float ws = 0;
+    for (int j = 0; j < k; j++) {
+        int best = -1;
+        for (int e = 0; e < ne; e++) {
+            int taken = 0;
+            for (int q = 0; q < j; q++) taken |= sel[q] == e;
+            if (!taken && (best < 0 || rl[e] > rl[best])) best = e;
+        }
+        sel[j] = best;
+        w[j] = rl[best];
+        ws += w[j];
+    }
+    for (int j = 0; j < k; j++) w[j] /= ws;
+}
+
+// routing for a chunk: each bf16 router row is converted once per 8 tokens
+static void route_batch(const q35_layer *L, const float *XN, int T, const q35_cfg *c, int k, int *sel, float *wsel) {
+    const int D = c->n_embd, NE = c->n_expert;
+    if (!L->router || D % 16 || NE > 512) { for (int t = 0; t < T; t++) route(L, XN + (size_t)t * D, c, k, sel + t * k, wsel + t * k); return; }
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int nt = T - t0 < 8 ? T - t0 : 8;
+        float rl[8][512];
+        const float *x[8];
+        for (int a = 0; a < 8; a++) x[a] = XN + (size_t)(t0 + (a < nt ? a : 0)) * D;
+        for (int e = 0; e < NE; e++) {
+            const uint16_t *wr = L->router + (size_t)e * D;
+            __m512 acc[8];
+            for (int a = 0; a < 8; a++) acc[a] = _mm512_setzero_ps();
+            for (int i = 0; i < D; i += 16) {
+                const __m512 w = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(wr + i))), 16));
+                for (int a = 0; a < 8; a++) acc[a] = _mm512_fmadd_ps(w, _mm512_loadu_ps(x[a] + i), acc[a]);
+            }
+            for (int a = 0; a < nt; a++) rl[a][e] = _mm512_reduce_add_ps(acc[a]);
+        }
+        for (int a = 0; a < nt; a++) route_pick(rl[a], NE, k, sel + (size_t)(t0 + a) * k, wsel + (size_t)(t0 + a) * k);
+    }
+}
+
 // ---------------- gated delta net (one token) ----------------
 static void delta_net(q35_model *m, const q35_layer *L, int ri, const float *xn, float *out, scratch *s) {
     const q35_cfg *c = &m->c;
@@ -567,12 +611,24 @@ static void delta_net(q35_model *m, const q35_layer *L, int ri, const float *xn,
 
 // ---------------- gated full attention (one token) ----------------
 static void softmax_inplace(float *x, int n) {
-    float mx = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
-    float s = 0;
-    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
+    __m512 vm = _mm512_set1_ps(-INFINITY);
+    int i = 0;
+    for (; i + 16 <= n; i += 16) vm = _mm512_max_ps(vm, _mm512_loadu_ps(x + i));
+    float mx = _mm512_reduce_max_ps(vm);
+    for (; i < n; i++) if (x[i] > mx) mx = x[i];
+    const __m512 m = _mm512_set1_ps(mx);
+    __m512 vs = _mm512_setzero_ps();
+    for (i = 0; i + 16 <= n; i += 16) {
+        const __m512 e = exp_ps(_mm512_sub_ps(_mm512_loadu_ps(x + i), m));
+        _mm512_storeu_ps(x + i, e);
+        vs = _mm512_add_ps(vs, e);
+    }
+    float s = _mm512_reduce_add_ps(vs);
+    for (; i < n; i++) { x[i] = expf(x[i] - mx); s += x[i]; }
     const float r = 1.0f / s;
-    for (int i = 0; i < n; i++) x[i] *= r;
+    const __m512 vr = _mm512_set1_ps(r);
+    for (i = 0; i + 16 <= n; i += 16) _mm512_storeu_ps(x + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), vr));
+    for (; i < n; i++) x[i] *= r;
 }
 // RoPE cos/sin for one position (NEOX pairs i, i + n_rot/2). Mellum's full-attention layers
 // use YaRN (ggml rope_yarn: interpolated/extrapolated mix per dim, cos/sin scaled by mscale).
@@ -1271,13 +1327,14 @@ int q35_draft(q35_model *m, int tok, int pos) {
 
 // ======================= batched prompt processing =======================
 //
-// A chunk of T tokens goes through each layer together. Every weight row is dequantized
+// A chunk of T tokens (QUARRY_PF_T, default 2048) goes through each layer together. Every weight row is dequantized
 // to f32 once per chunk and multiplied with all T activation rows (AVX-512 FMA), so the
 // weights are read once per chunk instead of once per token. Experts are grouped by the
 // tokens that picked them. The delta-net recurrence runs per head over the chunk, with
 // the 64KB head state kept in cache.
 
-#define Q35_PF_T 1024
+static int pf_t(void) { static int t; if (!t) { const char *e = getenv("QUARRY_PF_T"); t = e ? atoi(e) : 2048; if (t < 64) t = 64; } return t; }
+#define Q35_PF_T pf_t()
 #define MM_RB 16      // rows dequantized together
 
 // Y[t * ldy + r] = W_r . X[t * ldx], rows [0, rows), tokens [0, T); W from `base`
@@ -1600,23 +1657,25 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
         f32_to_f16(kc + (size_t)pos * kvd, k, kvd);
         f32_to_f16(vc + (size_t)pos * kvd, V + (size_t)t * kvd, kvd);
     }
+    double tcore = qnow();
     const float scale = 1.0f / sqrtf((float)HD);
     // work item: QB query tokens x the gqa heads sharing one KV head. K/V rows are converted
     // to f32 a block at a time and reused by all of the item's queries.
-    enum { QB = 8, KB = 64 };
+    enum { QB = 16, KB = 64 };
     const int NQ = QB * gqa, nqb = (T + QB - 1) / QB, S_all = pos0 + T;
     #pragma omp parallel
     {
         float *att = aligned_alloc(64, ((size_t)NQ * S_all * 4 + 63) / 64 * 64);
         float *Kf = aligned_alloc(64, (size_t)KB * HD * 4), *Vf = aligned_alloc(64, (size_t)KB * HD * 4);
+        float *Kt = aligned_alloc(64, (size_t)KB * HD * 4);   // K block transposed: [HD][KB]
         float *acc = aligned_alloc(64, (size_t)NQ * HD * 4);
         #pragma omp for schedule(dynamic, 1)
         for (int item = 0; item < nqb * NKV; item++) {
             const int qb = nqb - 1 - item / NKV, kvh = item % NKV;      // longest first
             const int tq0 = qb * QB, tq1 = tq0 + QB < T ? tq0 + QB : T, nt = tq1 - tq0;
             const int S = pos0 + tq1;                                   // keys needed by the last query
-            const float *qp[64];
-            int qpos[64], qlo[64];
+            const float *qp[256];
+            int qpos[256], qlo[256];
             for (int a = 0; a < nt; a++)
                 for (int g = 0; g < gqa; g++) {
                     qp[a * gqa + g] = QG + (size_t)(tq0 + a) * QD + (size_t)(kvh * gqa + g) * QS;
@@ -1629,40 +1688,96 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                 for (int k = kb; k < ke; k++)
                     for (int i = 0; i < HD; i += 16)
                         _mm512_storeu_ps(Kf + (size_t)(k - kb) * HD + i, f16x16(kc + (size_t)k * kvd + kvh * HD + i));
-                for (int q = 0; q < nq; q++) {
-                    const int lim = qpos[q] + 1 < ke ? qpos[q] + 1 : ke;
-                    float *aq = att + (size_t)q * S_all;
-                    for (int k = kb > qlo[q] ? kb : qlo[q]; k < lim; k++) {
-                        const float *kr = Kf + (size_t)(k - kb) * HD;
-                        __m512 a0 = _mm512_setzero_ps(), a1 = a0;
-                        for (int i = 0; i < HD; i += 32) {
-                            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qp[q] + i), _mm512_load_ps(kr + i), a0);
-                            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(qp[q] + i + 16), _mm512_load_ps(kr + i + 16), a1);
-                        }
-                        aq[k] = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1)) * scale;
+                // scores for 4 queries x 64 keys at a time: broadcast q[i] times row i of the
+                // transposed block (keys past ke are zero; scores outside a query's range are
+                // written but never read)
+                const int nk = ke - kb;
+                for (int i = 0; i < HD; i++)
+                    for (int j = 0; j < KB; j++) Kt[(size_t)i * KB + j] = j < nk ? Kf[(size_t)j * HD + i] : 0.0f;
+                const __m512 vs = _mm512_set1_ps(scale);
+                const __mmask16 tail[4] = {
+                    nk >= 16 ? 0xffff : (__mmask16)((1u << nk) - 1),
+                    nk >= 32 ? 0xffff : nk <= 16 ? 0 : (__mmask16)((1u << (nk - 16)) - 1),
+                    nk >= 48 ? 0xffff : nk <= 32 ? 0 : (__mmask16)((1u << (nk - 32)) - 1),
+                    nk >= 64 ? 0xffff : nk <= 48 ? 0 : (__mmask16)((1u << (nk - 48)) - 1)};
+                for (int q0 = 0; q0 < nq; q0 += 4) {
+                    const int qn = nq - q0 < 4 ? nq - q0 : 4;
+                    int any = 0;
+                    for (int a = 0; a < qn; a++) any |= qpos[q0 + a] >= kb && qlo[q0 + a] < ke;
+                    if (!any) continue;
+                    __m512 r[4][4];
+                    for (int a = 0; a < 4; a++) for (int j = 0; j < 4; j++) r[a][j] = _mm512_setzero_ps();
+                    const float *q_0 = qp[q0], *q_1 = qp[q0 + (qn > 1)], *q_2 = qp[q0 + (qn > 2 ? 2 : 0)], *q_3 = qp[q0 + (qn > 3 ? 3 : 0)];
+                    for (int i = 0; i < HD; i++) {
+                        const float *kt = Kt + (size_t)i * KB;
+                        const __m512 k0 = _mm512_load_ps(kt), k1 = _mm512_load_ps(kt + 16), k2 = _mm512_load_ps(kt + 32), k3 = _mm512_load_ps(kt + 48);
+                        __m512 b = _mm512_set1_ps(q_0[i]);
+                        r[0][0] = _mm512_fmadd_ps(b, k0, r[0][0]); r[0][1] = _mm512_fmadd_ps(b, k1, r[0][1]);
+                        r[0][2] = _mm512_fmadd_ps(b, k2, r[0][2]); r[0][3] = _mm512_fmadd_ps(b, k3, r[0][3]);
+                        b = _mm512_set1_ps(q_1[i]);
+                        r[1][0] = _mm512_fmadd_ps(b, k0, r[1][0]); r[1][1] = _mm512_fmadd_ps(b, k1, r[1][1]);
+                        r[1][2] = _mm512_fmadd_ps(b, k2, r[1][2]); r[1][3] = _mm512_fmadd_ps(b, k3, r[1][3]);
+                        b = _mm512_set1_ps(q_2[i]);
+                        r[2][0] = _mm512_fmadd_ps(b, k0, r[2][0]); r[2][1] = _mm512_fmadd_ps(b, k1, r[2][1]);
+                        r[2][2] = _mm512_fmadd_ps(b, k2, r[2][2]); r[2][3] = _mm512_fmadd_ps(b, k3, r[2][3]);
+                        b = _mm512_set1_ps(q_3[i]);
+                        r[3][0] = _mm512_fmadd_ps(b, k0, r[3][0]); r[3][1] = _mm512_fmadd_ps(b, k1, r[3][1]);
+                        r[3][2] = _mm512_fmadd_ps(b, k2, r[3][2]); r[3][3] = _mm512_fmadd_ps(b, k3, r[3][3]);
+                    }
+                    for (int a = 0; a < qn; a++) {
+                        float *aq = att + (size_t)(q0 + a) * S_all + kb;
+                        for (int j = 0; j < 4; j++) _mm512_mask_storeu_ps(aq + 16 * j, tail[j], _mm512_mul_ps(r[a][j], vs));
                     }
                 }
             }
-            for (int q = 0; q < nq; q++) softmax_inplace(att + (size_t)q * S_all + qlo[q], qpos[q] + 1 - qlo[q]);
+            // softmax over each query's range; zero the rest of [kstart, S) so the PV pass can
+            // run every query over the same keys
+            for (int q = 0; q < nq; q++) {
+                float *aq = att + (size_t)q * S_all;
+                softmax_inplace(aq + qlo[q], qpos[q] + 1 - qlo[q]);
+                if (qlo[q] > kstart) memset(aq + kstart, 0, (size_t)(qlo[q] - kstart) * 4);
+                if (qpos[q] + 1 < S) memset(aq + qpos[q] + 1, 0, (size_t)(S - qpos[q] - 1) * 4);
+            }
             memset(acc, 0, (size_t)nq * HD * 4);
             for (int kb = kstart; kb < S; kb += KB) {
                 const int ke = kb + KB < S ? kb + KB : S;
                 for (int k = kb; k < ke; k++)
                     for (int i = 0; i < HD; i += 16)
                         _mm512_storeu_ps(Vf + (size_t)(k - kb) * HD + i, f16x16(vc + (size_t)k * kvd + kvh * HD + i));
-                for (int q = 0; q < nq; q++) {
-                    const int lim = qpos[q] + 1 < ke ? qpos[q] + 1 : ke;
-                    const float *aq = att + (size_t)q * S_all;
-                    float *o = acc + (size_t)q * HD;
-                    for (int i0 = 0; i0 < HD; i0 += 128) {
-                        __m512 r[8];
-                        for (int j = 0; j < 8; j++) r[j] = _mm512_loadu_ps(o + i0 + 16 * j);
-                        for (int k = kb > qlo[q] ? kb : qlo[q]; k < lim; k++) {
-                            const __m512 a = _mm512_set1_ps(aq[k]);
+                // 4 queries x 64 dims per pass: each V row is loaded once for 4 queries
+                for (int q0 = 0; q0 < nq; q0 += 4) {
+                    const int qn = nq - q0 < 4 ? nq - q0 : 4;
+                    int lo = ke, hi = kb;   // keys any of the 4 queries uses in this block
+                    for (int a = 0; a < qn; a++) {
+                        const int l0 = qlo[q0 + a] > kb ? qlo[q0 + a] : kb, l1 = qpos[q0 + a] + 1 < ke ? qpos[q0 + a] + 1 : ke;
+                        if (l0 < lo) lo = l0;
+                        if (l1 > hi) hi = l1;
+                    }
+                    if (lo >= hi) continue;
+                    const float *a_0 = att + (size_t)q0 * S_all, *a_1 = att + (size_t)(q0 + (qn > 1)) * S_all,
+                                *a_2 = att + (size_t)(q0 + (qn > 2 ? 2 : 0)) * S_all, *a_3 = att + (size_t)(q0 + (qn > 3 ? 3 : 0)) * S_all;
+                    for (int i0 = 0; i0 < HD; i0 += 64) {
+                        __m512 r[4][4];
+                        for (int a = 0; a < 4; a++)
+                            for (int j = 0; j < 4; j++) r[a][j] = _mm512_loadu_ps(acc + (size_t)(q0 + (a < qn ? a : 0)) * HD + i0 + 16 * j);
+                        for (int k = lo; k < hi; k++) {
                             const float *vr = Vf + (size_t)(k - kb) * HD + i0;
-                            for (int j = 0; j < 8; j++) r[j] = _mm512_fmadd_ps(a, _mm512_load_ps(vr + 16 * j), r[j]);
+                            const __m512 v0 = _mm512_load_ps(vr), v1 = _mm512_load_ps(vr + 16), v2 = _mm512_load_ps(vr + 32), v3 = _mm512_load_ps(vr + 48);
+                            __m512 w = _mm512_set1_ps(a_0[k]);
+                            r[0][0] = _mm512_fmadd_ps(w, v0, r[0][0]); r[0][1] = _mm512_fmadd_ps(w, v1, r[0][1]);
+                            r[0][2] = _mm512_fmadd_ps(w, v2, r[0][2]); r[0][3] = _mm512_fmadd_ps(w, v3, r[0][3]);
+                            w = _mm512_set1_ps(a_1[k]);
+                            r[1][0] = _mm512_fmadd_ps(w, v0, r[1][0]); r[1][1] = _mm512_fmadd_ps(w, v1, r[1][1]);
+                            r[1][2] = _mm512_fmadd_ps(w, v2, r[1][2]); r[1][3] = _mm512_fmadd_ps(w, v3, r[1][3]);
+                            w = _mm512_set1_ps(a_2[k]);
+                            r[2][0] = _mm512_fmadd_ps(w, v0, r[2][0]); r[2][1] = _mm512_fmadd_ps(w, v1, r[2][1]);
+                            r[2][2] = _mm512_fmadd_ps(w, v2, r[2][2]); r[2][3] = _mm512_fmadd_ps(w, v3, r[2][3]);
+                            w = _mm512_set1_ps(a_3[k]);
+                            r[3][0] = _mm512_fmadd_ps(w, v0, r[3][0]); r[3][1] = _mm512_fmadd_ps(w, v1, r[3][1]);
+                            r[3][2] = _mm512_fmadd_ps(w, v2, r[3][2]); r[3][3] = _mm512_fmadd_ps(w, v3, r[3][3]);
                         }
-                        for (int j = 0; j < 8; j++) _mm512_storeu_ps(o + i0 + 16 * j, r[j]);
+                        for (int a = 0; a < qn; a++)
+                            for (int j = 0; j < 4; j++) _mm512_storeu_ps(acc + (size_t)(q0 + a) * HD + i0 + 16 * j, r[a][j]);
                     }
                 }
             }
@@ -1674,8 +1789,9 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
                     for (int i = 0; i < HD; i++) o[i] = c->gated ? acc[(size_t)q * HD + i] * sigmoidf(gate[i]) : acc[(size_t)q * HD + i];
                 }
         }
-        free(att); free(Kf); free(Vf); free(acc);
+        free(att); free(Kf); free(Vf); free(Kt); free(acc);
     }
+    q35_mp[7] += qnow() - tcore;
     mm(&L->wo, AO, NH * HD, T, b->R, D);
 }
 
@@ -1700,7 +1816,7 @@ static void pf_moe(q35_model *m, int l, q35_pfbuf *b, int T) {
     }
     q35_mp[0] += qnow() - tm; tm = qnow();
     // routing per token (router dots are parallel inside route(); tokens one after another)
-    for (int t = 0; t < T; t++) route(L, b->XN + (size_t)t * D, c, K, b->sel + t * K, b->wsel + t * K);
+    route_batch(L, b->XN, T, c, K, b->sel, b->wsel);
     memset(b->cnt, 0, NE * 4);
     for (int i = 0; i < T * K; i++) b->cnt[b->sel[i]]++;
     b->off[0] = 0;

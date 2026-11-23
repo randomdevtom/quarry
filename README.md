@@ -43,14 +43,16 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 
 | | |
 |---|---|
-| generation, short context (default: 6 of 8 experts, MTP speculation, 5GB cache) | ~6.2-7.6 tok/s |
+| generation, short context (default: all 8 experts, MTP speculation, 5GB cache) | ~5.5-6.9 tok/s |
 | generation without speculation (`QUARRY_NO_SPEC=1`) | ~6.6-6.8 tok/s |
-| generation, exact (`--experts 8`) | ~5.8 tok/s |
+| generation, `--experts 6` (faster, lossy) | ~6.2-7.6 tok/s |
 | generation at 12.6K context | ~4.6 tok/s |
-| prompt processing | ~28 tok/s (5K tokens), ~21 tok/s (12.6K tokens) |
+| prompt processing | ~32 tok/s (4K tokens) |
 | HumanEval subset (21 tasks), 6 experts / 8 experts | **20/21** (45s/task) / 20/21 (52s/task) |
 
 - logits match llama.cpp (cosine 0.998, same top token), token by token and batched
+- 6 experts per token was the default until it sent the model into a "..." loop on a short
+  chat turn that the full model answers normally; Qwen3.5/3.6/3.8 now run all 8
 - opencode end to end (write a file, run it): first turn 10 min (12.6K-token prompt),
   later turns reuse the cached prefix (~3s of prompt processing)
 - speculative decoding with the model's own MTP layer: it drafts one token, and the main model
@@ -82,6 +84,7 @@ others with YaRN RoPE), 64 experts, 8 used.
 | whole model fits in RAM | 8.6 tok/s | 9.2 tok/s |
 | 4GB memory limit (an 8GB laptop with a browser open) | **7.2 tok/s** | 3.5 tok/s (mmap; default settings are killed for running out of memory) |
 | 1.5GB expert cache | 4.2 tok/s | |
+| prompt processing (2465 tokens) | 34.8 tok/s | |
 
 - logits match llama.cpp (cosine 0.9999, same top token), on a 2465-token prompt as well,
   token by token and batched
@@ -151,7 +154,9 @@ Options:
 
 - `QUARRY_CACHE_GB`: expert cache size. Use most of your free RAM minus the dense
   weights (~0.9GB for Qwen3-Coder) and the KV cache (fp16, ~100KB per token of context).
-- `--experts N`: experts per token for Qwen MoE models (default 6; 8 is the exact model).
+- `--experts N`: experts per token (default 6 of 8 for Qwen3-Coder, all 8 for the rest; fewer is faster and lossy).
+- `QUARRY_PF_T`: prompt chunk size (default 2048). Bigger chunks read the experts from the SSD
+  fewer times per prompt and use more RAM (~170MB per 1024 tokens).
 - `-c N`: context length (default 4096). Memory is only used as the context fills.
 - `--skip 0.1` (Inkling, lossy): skip an expert that isn't in RAM when it has under 10%
   of the routing weight.
