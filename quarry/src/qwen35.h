@@ -80,6 +80,13 @@ typedef struct q35_model {
     // pf_rp, when set, gives the batched chunk's own (t, y, x) positions (image tokens)
     int rope_delta;
     const int *pf_rp;
+    // sparse long-context attention: per attention layer, per SBLK-row block, min and max key
+    uint16_t *ksum;                 // [n_attn][nsblk][2][n_head_kv * hd] fp16
+    int nsblk, *sum_upto;           // blocks per layer; blocks summarized so far per layer
+    float *sp_score, *sp_tmp;
+    int *sel_blk, *sel_n, sel_cap, *sel_age, *sel_pos;   // last chosen blocks per layer/KV head, reused for a few steps
+    int *rl;                        // [n_head_kv][n_ctx] rows attended this step
+    uint64_t sp_rows, sp_full;      // rows attended vs rows in context (sparse steps)
     int *pred;                      // [n_layer][16] guesses for the next layer
     int pred_n;                     // guesses per layer
 } q35_model;
@@ -103,4 +110,7 @@ void q35_commit(q35_model *m, int keep_both);
 // input embeddings (n x n_embd, e.g. image features) at cache rows row0.., RoPE positions
 // rp[0..n) (t), rp[n..2n) (y), rp[2n..3n) (x)
 void q35_prefill_embd(q35_model *m, const float *emb, int n, int row0, const int *rp);
-extern double q35_prof[8], q35_mp[8];
+void q35_kv_from(q35_model *m, int pos);
+void q35_sparse_set(int budget, int recent, int min_ctx, int reselect);   // sparse attention settings (tests)
+void q35_kv_summarize_all(q35_model *m, int rows);   // after writing cache rows directly   // rows from pos on will be rewritten
+extern double q35_prof[8], q35_mp[8], q35_sp[3];

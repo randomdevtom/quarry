@@ -394,6 +394,26 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
         if (n < 0 || n >= e->n_ctx - 8) { emit("[prompt too long]", ud); free(toks); return; }
         lg = eng_prefill(e, toks, n);
     }
+    // speed testing at long context without a long prefill: fill the attention KV cache up to
+    // QUARRY_FAKE_CTX rows by repeating the prompt's rows, then generate after them
+    if (e->q35 && getenv("QUARRY_FAKE_CTX")) {
+        const int N = atoi(getenv("QUARRY_FAKE_CTX"));
+        if (N > n && N < e->n_ctx - 64) {
+            const size_t kvd = (size_t)e->qm.c.n_head_kv * e->qm.c.hd;
+            for (int a = 0; a < e->qm.n_attn; a++) {
+                uint16_t *kc = e->qm.kc + (size_t)a * e->qm.c.n_ctx * kvd, *vc = e->qm.vc + (size_t)a * e->qm.c.n_ctx * kvd;
+                for (int r = n; r < N; r++) {
+                    memcpy(kc + r * kvd, kc + (size_t)(r % n) * kvd, kvd * 2);
+                    memcpy(vc + r * kvd, vc + (size_t)(r % n) * kvd, kvd * 2);
+                }
+            }
+            q35_kv_from(&e->qm, n);
+            q35_kv_summarize_all(&e->qm, N);
+            for (int r = n; r < N; r++) e->ctx_tokens[r] = -1;
+            fprintf(stderr, "[fake context: %d rows]\n", N);
+            n = N;
+        }
+    }
     if (max_tokens > e->n_ctx - n) max_tokens = e->n_ctx - n;
     st->prompt_tokens = n;
     st->t_prompt = now() - t0;
@@ -543,6 +563,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
                                 (unsigned long long)e->qm.spec_steps, 100.0 * e->qm.spec_accepted / e->qm.spec_steps, e->qm.draft_seconds);
             if (e->q35) fprintf(stderr, " | prediction %.0f%% | delta-net %.1fs attn %.1fs route %.1fs experts %.1fs shared %.1fs output %.1fs (delta-net proj %.1fs, conv+recur %.1fs)",
                                 100.0 * e->qm.pred_correct / (e->qm.pred_total + 1e-9), q35_prof[0], q35_prof[1], q35_prof[2], q35_prof[3], q35_prof[4], q35_prof[5], q35_prof[6], q35_prof[7]);
+            if (e->q35 && e->qm.sp_full) fprintf(stderr, " | sparse attn: %.1f%% of rows, summarize %.2fs score %.2fs pick %.2fs",
+                                100.0 * e->qm.sp_rows / e->qm.sp_full, q35_sp[0], q35_sp[1], q35_sp[2]);
             if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);
             fprintf(stderr, "]\n");
         }
@@ -1545,6 +1567,70 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         if (fi) fclose(fi);
     }
     if (n <= 0 || n >= e->n_ctx) { fprintf(stderr, "prompt has %d tokens, ctx %d\n", n, e->n_ctx); return 1; }
+    if (e->q35 && getenv("QUARRY_SPARSE_CHECK")) {
+        // long-context quality of sparse attention: prefill the first n - T tokens, then
+        // teacher-force the last T with exact attention and with each "budget:recent" setting
+        // from QUARRY_SPARSE_CHECK; report KL(exact || sparse), top-token agreement, and how
+        // often each predicts the real next token
+        const int T = getenv("QUARRY_CHECK_T") ? atoi(getenv("QUARRY_CHECK_T")) : 256, P = n - T, nv = n_vocab(e);
+        enum { TK = 64 };
+        if (P < 1024) { fprintf(stderr, "text too short\n"); return 1; }
+        q35_sparse_set(1 << 30, 1 << 30, 1 << 30, 1);
+        double t0 = now();
+        q35_state_reset(&e->qm); e->qm.rope_delta = 0;
+        q35_prefill(&e->qm, toks, P, 0);
+        printf("prefill %d tokens: %.1fs\n", P, now() - t0);
+        void *snap = malloc(q35_state_bytes(&e->qm));
+        q35_state_save(&e->qm, snap);
+        int *rid = malloc(sizeof(int) * T * TK); float *rlp = malloc(sizeof(float) * T * TK);
+        char cfgs[256];
+        snprintf(cfgs, sizeof cfgs, "exact,%s", getenv("QUARRY_SPARSE_CHECK"));
+        for (char *tok = strtok(cfgs, ","); tok; tok = strtok(NULL, ",")) {
+            const int exact = !strcmp(tok, "exact");
+            int bud = 0, rec = 0, rs = 1;
+            const int pf = !strncmp(tok, "pf:", 3);   // "pf:budget:recent": sparse prefill, exact decode
+            if (!exact && sscanf(tok + (pf ? 3 : 0), "%d:%d:%d", &bud, &rec, &rs) < 2) continue;
+            if (pf) {
+                q35_sparse_set(bud, rec, 0, 1);
+                q35_state_reset(&e->qm); e->qm.rope_delta = 0;
+                double tp = now();
+                q35_prefill(&e->qm, toks, P, 0);
+                printf("sparse prefill %d tokens: %.1fs\n", P, now() - tp);
+                q35_sparse_set(1 << 30, 1 << 30, 1 << 30, 1);
+            } else if (exact) q35_sparse_set(1 << 30, 1 << 30, 1 << 30, 1); else q35_sparse_set(bud, rec, 0, rs);
+            if (!pf) q35_state_load(&e->qm, snap);
+            e->qm.sp_rows = e->qm.sp_full = 0;
+            double kl = 0, t1 = now(); int agree = 0, hit = 0;
+            for (int i = 0; i < T; i++) {
+                const float *lg = q35_forward(&e->qm, toks[P + i], P + i);
+                double mx = lg[0], z = 0;
+                for (int v = 1; v < nv; v++) if (lg[v] > mx) mx = lg[v];
+                for (int v = 0; v < nv; v++) z += exp(lg[v] - mx);
+                const double lz = mx + log(z);
+                int am = 0;
+                for (int v = 1; v < nv; v++) if (lg[v] > lg[am]) am = v;
+                if (i + 1 < T) hit += am == toks[P + i + 1];
+                if (exact) {
+                    int *id = rid + (size_t)i * TK; float *lp = rlp + (size_t)i * TK; int k = 0;
+                    for (int v = 0; v < nv; v++)
+                        if (k < TK || lg[v] - lz > lp[k - 1]) {
+                            int j = k < TK ? k++ : TK - 1;
+                            while (j > 0 && lp[j - 1] < lg[v] - lz) { lp[j] = lp[j - 1]; id[j] = id[j - 1]; j--; }
+                            lp[j] = lg[v] - lz; id[j] = v;
+                        }
+                } else {
+                    for (int j = 0; j < TK; j++) kl += exp(rlp[(size_t)i * TK + j]) * (rlp[(size_t)i * TK + j] - (lg[rid[(size_t)i * TK + j]] - lz));
+                    agree += am == rid[(size_t)i * TK];
+                }
+            }
+            if (exact) printf("exact: predicts the next token %.1f%% | %.2f tok/s\n", 100.0 * hit / (T - 1), T / (now() - t1));
+            else printf("%sbudget %d recent %d reselect %d (%.1f%% of rows): KL %.5f, top token agrees %.1f%%, predicts next %.1f%% | %.2f tok/s\n",
+                        pf ? "prefill " : "", bud, rec, rs, 100.0 * e->qm.sp_rows / (e->qm.sp_full + 1e-9), kl / T, 100.0 * agree / T, 100.0 * hit / (T - 1), T / (now() - t1));
+            fflush(stdout);
+        }
+        free(snap); free(rid); free(rlp); free(toks);
+        return 0;
+    }
     if (e->ink && (getenv("QUARRY_KL_SAVE") || getenv("QUARRY_KL_REF"))) {
         // teacher-forced quality check: per position, the reference's top 64 log-probs; a later
         // run reports KL(reference || this run) over them and how often the top token agrees
