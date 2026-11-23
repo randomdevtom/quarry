@@ -419,7 +419,7 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     if (getenv("QUARRY_STATS")) {   // decode-only profile
         experts_reset_stats(eng_experts(e));
         memset(q35_prof, 0, sizeof q35_prof);
-        if (e->q35) { e->qm.draft_seconds = 0; e->qm.spec_steps = e->qm.spec_accepted = 0; e->qm.pred_total = e->qm.pred_correct = 0; }
+        if (e->q35) { e->qm.expert_bytes_read = 0; e->qm.draft_seconds = 0; e->qm.spec_steps = e->qm.spec_accepted = 0; e->qm.pred_total = e->qm.pred_correct = 0; }
     }
     st->t_prompt = now() - t0;
     t0 = now();
