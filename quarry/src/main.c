@@ -1763,6 +1763,15 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc) {   // prompt from a file
+            FILE *pf = fopen(argv[++i], "rb");
+            if (!pf) { perror(argv[i]); return 1; }
+            fseek(pf, 0, SEEK_END); long pl = ftell(pf); fseek(pf, 0, SEEK_SET);
+            char *pb = malloc(pl + 1);
+            pb[fread(pb, 1, pl, pf)] = 0;
+            fclose(pf);
+            prompt = pb;
+        }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--experts") && i + 1 < argc) setenv("QUARRY_TOPK", argv[++i], 1);
