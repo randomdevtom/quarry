@@ -24,6 +24,33 @@
 #include "model.h"
 #include "qwen35.h"
 #include "chat_html.h"   // generated from src/chat.html by the Makefile
+#ifdef QUARRY_VISION
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#endif
+
+// images of the current request (decoded data URLs), in prompt order; content_text() puts a
+// media marker in the text where each one goes
+#define MAX_IMGS 8
+static unsigned char *g_img[MAX_IMGS];
+static size_t g_img_len[MAX_IMGS];
+static int g_nimg;
+static void imgs_clear(void) { for (int i = 0; i < g_nimg; i++) free(g_img[i]); g_nimg = 0; }
+static unsigned char *b64_decode(const char *s, size_t n, size_t *out_len) {
+    static int8_t tab[256];
+    if (!tab['B']) { memset(tab, -1, 256); const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                     for (int i = 0; i < 64; i++) tab[(unsigned char)a[i]] = i; tab['-'] = 62; tab['_'] = 63; }
+    unsigned char *o = malloc(n / 4 * 3 + 4);
+    size_t k = 0; uint32_t acc = 0; int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int v = tab[(unsigned char)s[i]];
+        if (v < 0) continue;   // padding, whitespace, escaped slashes
+        acc = acc << 6 | v; bits += 6;
+        if (bits >= 8) { bits -= 8; o[k++] = (unsigned char)(acc >> bits); }
+    }
+    *out_len = k;
+    return o;
+}
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
@@ -36,6 +63,9 @@ typedef struct {
     ink_model im;
     q35_model qm;
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
+    void *mctx;                        // mtmd vision context (Qwen3.5/3.6 + mmproj), NULL if none
+    int snap_delta;                    // q35: RoPE position offset at the snapshot
+    int t_im_start;                    // "<|im_start|>": the snapshot is taken before the last one
     int (*reason_emit)(const char *, void *);   // if set: thinking text goes here (HTTP reasoning_content)
     char model_name[256];              // GGUF file name, shown by the chat page
     int last_prompt, last_gen;         // last request: tokens and seconds (for /v1/stats)
@@ -82,6 +112,7 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
         e->snap = malloc(q35_state_bytes(&e->qm));
         int t[8];
         e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_im_start = llama_tokenize(e->vocab, "<|im_start|>", 12, t, 8, false, true) == 1 ? t[0] : -1;
     } else if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
     if (e->ink) {
         int t[8];
@@ -156,6 +187,12 @@ static int sample(engine *e, float *lg, float temp, float top_p) {
     return idx[0];
 }
 
+// where to snapshot the recurrent state: before the last <|im_start|> after `from`, else at n - 1
+static int snap_cut(engine *e, const int *toks, int from, int n) {
+    for (int i = n - 1; i > from; i--) if (toks[i] == e->t_im_start) return i;
+    return from > n - 1 ? from : n - 1;
+}
+
 // feed prompt tokens, reusing the KV of the longest common prefix
 static float *eng_prefill(engine *e, const int *toks, int n) {
     int common = 0;
@@ -165,17 +202,21 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
         // the delta-net state can't be rewound: continue from the current end, or from the
         // snapshot taken at the end of the last prompt, or start over
         if (!(common == e->n_ctx_tokens && common > 0)) {
-            if (e->snap_pos > 0 && common >= e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; }
+            if (e->snap_pos > 0 && common >= e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; e->qm.rope_delta = e->snap_delta; }
             else {
                 q35_state_reset(&e->qm);
                 common = 0;
+                e->qm.rope_delta = 0;
             }
         }
-        float *lg = prefill(e, toks + common, n - common, common);
+        // snapshot before the final "<|im_start|>assistant": the next turn re-renders this
+        // reply without its empty think block, so a snapshot at the very end would never match
+        const int cut = snap_cut(e, toks, common, n);
+        if (cut > common) prefill(e, toks + common, cut - common, common);
+        if (cut > common || e->snap_pos != cut) { q35_state_save(&e->qm, e->snap); e->snap_pos = cut; e->snap_delta = e->qm.rope_delta; }
+        float *lg = prefill(e, toks + cut, n - cut, cut);
         for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
         e->n_ctx_tokens = n;
-        q35_state_save(&e->qm, e->snap);
-        e->snap_pos = n;
         return lg;
     }
     float *lg = prefill(e, toks + common, n - common, common);
@@ -235,14 +276,120 @@ static float sample_prob(engine *e, const float *lg, float temp, float top_p, in
 
 typedef struct { int prompt_tokens, gen_tokens; double t_prompt, t_gen; } gen_stats;
 
+#ifdef QUARRY_VISION
+// prompt with images: mtmd splits it into text and image chunks. Image tokens get a pseudo id
+// (from the image's hash) so the prefix cache only reuses an identical image.
+static float *eng_prefill_mm(engine *e, const char *prompt, int *toks, int *n_out, const char **err) {
+    mtmd_context *mc = e->mctx;
+    mtmd_bitmap *bms[MAX_IMGS];
+    int nb = 0;
+    *err = NULL;
+    for (int i = 0; i < g_nimg; i++) {
+        struct mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_buf(mc, g_img[i], g_img_len[i], false, mtmd_helper_init_opt_default());
+        if (!w.bitmap) { *err = "[could not read an image: use PNG, JPEG, GIF or BMP]"; for (int j = 0; j < nb; j++) mtmd_bitmap_free(bms[j]); return NULL; }
+        bms[nb++] = w.bitmap;
+    }
+    mtmd_input_chunks *ch = mtmd_input_chunks_init();
+    mtmd_input_text txt = {prompt, strlen(prompt), false, true};
+    const int rc = mtmd_tokenize(mc, ch, &txt, (const mtmd_bitmap *const *)bms, nb);
+    for (int j = 0; j < nb; j++) mtmd_bitmap_free(bms[j]);
+    if (rc) { mtmd_input_chunks_free(ch); *err = "[image processing failed]"; return NULL; }
+    // flatten: token ids, and where each image chunk sits
+    const size_t nc = mtmd_input_chunks_size(ch);
+    int n = 0, seg_start[MAX_IMGS * 2], seg_chunk[MAX_IMGS * 2], nseg = 0;
+    for (size_t i = 0; i < nc; i++) {
+        const mtmd_input_chunk *c = mtmd_input_chunks_get(ch, i);
+        size_t k = mtmd_input_chunk_get_n_tokens(c);
+        if (n + (int)k >= e->n_ctx - 8) { mtmd_input_chunks_free(ch); *err = "[prompt too long]"; return NULL; }
+        if (mtmd_input_chunk_get_type(c) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            const llama_token *tk = mtmd_input_chunk_get_tokens_text(c, &k);
+            for (size_t j = 0; j < k; j++) toks[n++] = tk[j];
+        } else {
+            const char *id = mtmd_input_chunk_get_id(c);
+            uint32_t h = 2166136261u;
+            for (const char *p = id ? id : ""; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+            for (size_t j = 0; j < k; j++) toks[n + j] = -1 - (int)(h & 0x3fffffff);
+            if (nseg < MAX_IMGS * 2) { seg_start[nseg] = n; seg_chunk[nseg++] = (int)i; }
+            n += (int)k;
+        }
+    }
+    // longest reusable prefix, never ending inside an image
+    int common = 0;
+    while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
+    if (common == n) common = n - 1;
+    for (int s = 0; s < nseg; s++) {
+        const int k = (int)mtmd_input_chunk_get_n_tokens(mtmd_input_chunks_get(ch, seg_chunk[s]));
+        if (common > seg_start[s] && common < seg_start[s] + k) common = seg_start[s];
+    }
+    if (!(common == e->n_ctx_tokens && common > 0) && !(e->snap_pos > 0 && common >= e->snap_pos)) common = 0;
+    if (common == e->n_ctx_tokens && common > 0) { /* continue from the current state */ }
+    else if (common > 0) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; }
+    else q35_state_reset(&e->qm);
+    // RoPE offset at `common`: each image before it takes n_pos positions for its n tokens
+    int delta = 0;
+    for (int s = 0; s < nseg; s++) {
+        const mtmd_input_chunk *c = mtmd_input_chunks_get(ch, seg_chunk[s]);
+        if (seg_start[s] < common) delta += (int)mtmd_input_chunk_get_n_pos(c) - (int)mtmd_input_chunk_get_n_tokens(c);
+    }
+    e->qm.rope_delta = delta;
+    float *lg = NULL;
+    int at = common;
+    const int cut = snap_cut(e, toks, nseg ? seg_start[nseg - 1] : common, n);
+    for (int s = 0; s <= nseg && !*err; s++) {
+        const int end = s < nseg ? seg_start[s] : n;
+        if (s == nseg && cut > at && cut < end) {   // last text run: snapshot before the final turn
+            prefill(e, toks + at, cut - at, at);
+            at = cut;
+            q35_state_save(&e->qm, e->snap); e->snap_pos = cut; e->snap_delta = e->qm.rope_delta;
+        }
+        if (end > at) { lg = prefill(e, toks + at, end - at, at); at = end; }
+        if (s == nseg || seg_start[s] < common) continue;
+        const mtmd_input_chunk *c = mtmd_input_chunks_get(ch, seg_chunk[s]);
+        const int k = (int)mtmd_input_chunk_get_n_tokens(c);
+        double t0 = now();
+        if (mtmd_encode_chunk(mc, c)) { *err = "[image encoding failed]"; break; }
+        fprintf(stderr, "[image: %d tokens, encoded in %.1fs]\n", k, now() - t0);
+        const float *emb = mtmd_get_output_embd(mc);
+        const mtmd_image_tokens *it = mtmd_input_chunk_get_tokens_image(c);
+        int *rp = malloc(sizeof(int) * 3 * k);
+        for (int j = 0; j < k; j++) {
+            struct mtmd_decoder_pos dp = mtmd_image_tokens_get_decoder_pos(it, at + e->qm.rope_delta, j);
+            rp[j] = dp.t; rp[k + j] = dp.y; rp[2 * k + j] = dp.x;
+        }
+        q35_prefill_embd(&e->qm, emb, k, at, rp);
+        free(rp);
+        e->qm.rope_delta += (int)mtmd_input_chunk_get_n_pos(c) - k;
+        at += k;
+    }
+    mtmd_input_chunks_free(ch);
+    if (*err) { e->n_ctx_tokens = 0; e->snap_pos = 0; return NULL; }
+    for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
+    e->n_ctx_tokens = n;
+    // (when the cut fell inside the reused prefix, the existing snapshot stays valid)
+    *n_out = n;
+    return lg;
+}
+#endif
+
 static void eng_generate(engine *e, const char *prompt, int max_tokens, float temp, float top_p,
                          emit_fn emit, void *ud, gen_stats *st) {
     int *toks = malloc(sizeof(int) * e->n_ctx);
-    int n = tokenize(e, prompt, toks, e->n_ctx);
-    if (n < 0 || n >= e->n_ctx - 8) { emit("[prompt too long]", ud); free(toks); return; }
-    if (max_tokens > e->n_ctx - n) max_tokens = e->n_ctx - n;
+    int n;
+    float *lg;
     double t0 = now();
-    float *lg = eng_prefill(e, toks, n);
+#ifdef QUARRY_VISION
+    if (g_nimg && e->mctx) {
+        const char *err;
+        lg = eng_prefill_mm(e, prompt, toks, &n, &err);
+        if (!lg) { emit(err ? err : "[image processing failed]", ud); free(toks); return; }
+    } else
+#endif
+    {
+        n = tokenize(e, prompt, toks, e->n_ctx);
+        if (n < 0 || n >= e->n_ctx - 8) { emit("[prompt too long]", ud); free(toks); return; }
+        lg = eng_prefill(e, toks, n);
+    }
+    if (max_tokens > e->n_ctx - n) max_tokens = e->n_ctx - n;
     st->prompt_tokens = n;
     st->t_prompt = now() - t0;
     t0 = now();
@@ -485,8 +632,19 @@ static char *content_text(const char *v) {
     for (;;) {
         v = skip_ws(v);
         if (*v != '{') break;
-        const char *t = json_get(v, "text");
-        if (t && *skip_ws(t) == '"') {
+        const char *t = json_get(v, "text"), *iu = json_get(v, "image_url");
+        if (iu) {   // {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}} (or a bare string)
+            const char *u = *skip_ws(iu) == '{' ? json_get(iu, "url") : iu;
+            char *url = u && *skip_ws(u) == '"' ? json_str(skip_ws(u), NULL) : NULL;
+            const char *comma = url && !strncmp(url, "data:", 5) ? strchr(url, ',') : NULL;
+            if (comma && g_nimg < MAX_IMGS) {
+                g_img[g_nimg] = b64_decode(comma + 1, strlen(comma + 1), &g_img_len[g_nimg]);
+                g_nimg++;
+                out = realloc(out, strlen(out) + 16);
+                strcat(out, "<__media__>");
+            }
+            free(url);
+        } else if (t && *skip_ws(t) == '"') {
             char *s = json_str(skip_ws(t), NULL);
             out = realloc(out, strlen(out) + strlen(s) + 1);
             strcat(out, s);
@@ -1144,11 +1302,11 @@ static void handle(engine *e, int fd) {
         int bl = snprintf(b, sizeof b,
             "{\"model\":\"%s\",\"arch\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,\"cache_gb\":%.1f,"
             "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
-            "\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
+            "\"vision\":%s,\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
             e->model_name, e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
             getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
             h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
-            e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
+            e->mctx ? "true" : "false", e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
         send_all(fd, hdr, n);
         send_all(fd, b, bl);
@@ -1162,6 +1320,7 @@ static void handle(engine *e, int fd) {
         const char *msgs = json_get(body, "messages");
         if (msgs && *(msgs = skip_ws(msgs)) == '[') {
             const char *v = msgs + 1;
+            imgs_clear();
             while (nm < 256) {
                 v = skip_ws(v);
                 if (*v != '{') break;
@@ -1388,6 +1547,7 @@ int main(int argc, char **argv) {
     int n = 1024, port = 8090, ctx = 4096;
     float temp = 0.7f, effort = 0.2f;
     int think_flag = 0;
+    const char *mmproj = NULL;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
@@ -1395,6 +1555,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--experts") && i + 1 < argc) setenv("QUARRY_TOPK", argv[++i], 1);
         else if (!strcmp(argv[i], "--think")) think_flag = 1;
+        else if (!strcmp(argv[i], "--mmproj") && i + 1 < argc) mmproj = argv[++i];
         else if (!strcmp(argv[i], "--temp") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -1421,6 +1582,34 @@ int main(int argc, char **argv) {
     }
     e.effort = effort;
     e.think_default = think_flag;
+#ifdef QUARRY_VISION
+    {   // vision: --mmproj, QUARRY_MMPROJ, or an mmproj*.gguf next to the model (Qwen3.5/3.6)
+        char found[4096] = "";
+        const char *mp = mmproj ? mmproj : getenv("QUARRY_MMPROJ");
+        if (!mp && e.q35 && !e.qm.c.mellum) {
+            char dir[4096];
+            snprintf(dir, sizeof dir, "%s", model);
+            char *sl = strrchr(dir, '/');
+            if (sl) *sl = 0; else strcpy(dir, ".");
+            char cmdl[4200];
+            snprintf(cmdl, sizeof cmdl, "ls -1 '%s'/mmproj*.gguf '%s'/*mmproj*.gguf 2>/dev/null | head -1", dir, dir);
+            FILE *pf = popen(cmdl, "r");
+            if (pf) { if (fgets(found, sizeof found, pf)) found[strcspn(found, "\n")] = 0; pclose(pf); }
+            if (found[0]) mp = found;
+        }
+        if (mp && *mp && strcmp(mp, "none")) {
+            struct mtmd_context_params cp = mtmd_context_params_default();
+            cp.use_gpu = false;
+            cp.n_threads = 4;
+            cp.print_timings = false;
+            // image size: tokens per image (more = sharper, slower: the encoder runs on the CPU)
+            cp.image_max_tokens = getenv("QUARRY_IMAGE_TOKENS") ? atoi(getenv("QUARRY_IMAGE_TOKENS")) : 256;
+            if (!getenv("QUARRY_VERBOSE")) mtmd_helper_log_set(quiet_log, NULL);
+            e.mctx = mtmd_init_from_file(mp, e.tok_model, cp);
+            fprintf(stderr, e.mctx ? "quarry: vision on (%s)\n" : "quarry: could not load vision model %s\n", mp);
+        }
+    }
+#endif
     g_eng = &e;
     if (!strcmp(cmd, "run")) return cmd_run(&e, prompt, n, temp);
     if (!strcmp(cmd, "serve")) return cmd_serve(&e, host, port);

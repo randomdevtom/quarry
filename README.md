@@ -61,6 +61,17 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
 - the output layer (248K vocab) runs from a 4-bit copy that picks 64 candidates, whose exact
   logits are computed from the file's rows (`QUARRY_EXACT_OUTPUT=1` keeps the full matrix in RAM)
 
+### Images (Qwen3.5/3.6)
+
+Put the model's vision encoder (`mmproj*.gguf`, e.g. the 0.9GB BF16 one from the model's GGUF
+repo) next to the model, or pass `--mmproj`. Images go in OpenAI-style `image_url` parts
+(base64 data URLs); the chat page has an attach button, and paste and drag-and-drop work.
+
+- the encoder runs through llama.cpp's libmtmd on the CPU: ~10s for a 256-token image
+  (`QUARRY_IMAGE_TOKENS`, default 256), then ~20s to read it into the model
+- image tokens get Qwen's interleaved 3D (M-RoPE) positions
+- follow-up questions reuse the processed image (4s instead of 28s)
+
 ### Mellum 2.1 12B-A2.5B Thinking (Q4_0, 7.0GB, `mellum`)
 
 JetBrains' coding MoE: 28 attention layers (3 of every 4 with a 1024-token sliding window, the

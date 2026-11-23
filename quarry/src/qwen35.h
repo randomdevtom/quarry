@@ -42,6 +42,7 @@ typedef struct {
     // layers, YaRN RoPE on the others
     int mellum, gated, n_swa;
     float rope_base_swa, yarn_freq_scale, yarn_mscale, yarn_corr[2];
+    int sect[4];                    // interleaved M-RoPE sections (Qwen3.5/3.6 vision), 0 if none
 } q35_cfg;
 
 typedef struct q35_model {
@@ -75,6 +76,10 @@ typedef struct q35_model {
     float *h2[2], *logits2[2];      // 2-token verify outputs
     uint64_t spec_steps, spec_accepted;
     double draft_seconds;
+    // positions: RoPE position = cache row + rope_delta (images take fewer positions than rows);
+    // pf_rp, when set, gives the batched chunk's own (t, y, x) positions (image tokens)
+    int rope_delta;
+    const int *pf_rp;
     int *pred;                      // [n_layer][16] guesses for the next layer
     int pred_n;                     // guesses per layer
 } q35_model;
@@ -95,4 +100,7 @@ int q35_draft(q35_model *m, int tok, int pos);
 // Then q35_commit(m, 1) keeps both tokens, q35_commit(m, 0) keeps only tok0.
 void q35_forward2(q35_model *m, int tok0, int tok1, int pos);
 void q35_commit(q35_model *m, int keep_both);
+// input embeddings (n x n_embd, e.g. image features) at cache rows row0.., RoPE positions
+// rp[0..n) (t), rp[n..2n) (y), rp[2n..3n) (x)
+void q35_prefill_embd(q35_model *m, const float *emb, int n, int row0, const int *rp);
 extern double q35_prof[8], q35_mp[8];

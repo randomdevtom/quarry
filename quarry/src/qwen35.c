@@ -90,6 +90,7 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     c->n_head_kv = qg_get_int(g, K("attention.head_count_kv"), 0);
     c->hd = qg_get_int(g, K("attention.key_length"), 0);
     c->n_rot = qg_get_int(g, K("rope.dimension_count"), c->hd);
+    for (int i = 0; i < 4; i++) c->sect[i] = arr_int(g, K("rope.dimension_sections"), i, 0);
     c->rope_base = qg_get_float(g, K("rope.freq_base"), 1e7);
     c->eps = qg_get_float(g, K("attention.layer_norm_rms_epsilon"), 1e-6);
     c->n_expert = qg_get_int(g, K("expert_count"), 0);
@@ -575,12 +576,21 @@ static void softmax_inplace(float *x, int n) {
 }
 // RoPE cos/sin for one position (NEOX pairs i, i + n_rot/2). Mellum's full-attention layers
 // use YaRN (ggml rope_yarn: interpolated/extrapolated mix per dim, cos/sin scaled by mscale).
-static void rope_cs(const q35_cfg *c, const q35_layer *L, int pos, float *cs, float *sn) {
+static void rope_cs(const q35_cfg *c, const q35_layer *L, int pos, int py, int px, float *cs, float *sn) {
     const int half = c->n_rot / 2;
+    const int nsect = c->sect[0] + c->sect[1] + c->sect[2] + c->sect[3];
     const int yarn = c->mellum && !L->is_swa && c->yarn_freq_scale > 0;
     const float base = c->mellum && L->is_swa ? c->rope_base_swa : c->rope_base;
     for (int i = 0; i < half; i++) {
-        const float ext = pos * powf(base, -2.0f * i / c->n_rot);
+        // interleaved M-RoPE (ggml IMROPE): dims cycle t, y, x within their section limits;
+        // text tokens have t = y = x, which makes this plain RoPE
+        int p = pos;
+        if (nsect) {
+            const int sec = i % nsect;
+            if (sec % 3 == 1 && sec < 3 * c->sect[1]) p = py;
+            else if (sec % 3 == 2 && sec < 3 * c->sect[2]) p = px;
+        }
+        const float ext = p * powf(base, -2.0f * i / c->n_rot);
         float th = ext, ms = 1.0f;
         if (yarn) {
             const float interp = c->yarn_freq_scale * ext;
@@ -605,7 +615,8 @@ static void attn_prep(const q35_model *m, const q35_layer *L, const float *qg, f
     const int HD = c->hd, NH = c->n_head, NKV = c->n_head_kv, kvd = NKV * HD;
     const int half = c->n_rot / 2, qs = c->gated ? 2 * HD : HD;
     float cs[256], sn[256];
-    rope_cs(c, L, rpos, cs, sn);
+    const int rp = rpos + m->rope_delta;
+    rope_cs(c, L, rp, rp, rp, cs, sn);
     for (int h = 0; h < NH + NKV; h++) {
         float *p = h < NH ? qh_all + (size_t)h * HD : k + (size_t)(h - NH) * HD;
         if (h < NH) memcpy(p, qg + (size_t)h * qs, HD * 4);
@@ -1574,7 +1585,8 @@ static void pf_attention(q35_model *m, const q35_layer *L, int ai, q35_pfbuf *b,
     for (int t = 0; t < T; t++) {
         const int pos = pos0 + t;
         float cs[256], sn[256];
-        rope_cs(c, L, pos, cs, sn);
+        if (m->pf_rp) rope_cs(c, L, m->pf_rp[t], m->pf_rp[T + t], m->pf_rp[2 * T + t], cs, sn);
+        else { const int rp = pos + m->rope_delta; rope_cs(c, L, rp, rp, rp, cs, sn); }
         float *qg = QG + (size_t)t * QD, *k = K + (size_t)t * kvd;
         for (int h = 0; h < NH + NKV; h++) {
             float *p = h < NH ? qg + (size_t)h * QS : k + (size_t)(h - NH) * HD;   // q in place, gate after it
@@ -1750,11 +1762,12 @@ static void pf_moe(q35_model *m, int l, q35_pfbuf *b, int T) {
     m->expert_loads += nm;
 }
 
-static void pf_chunk(q35_model *m, const int *tokens, int T, int pos0) {
+static void pf_chunk(q35_model *m, const int *tokens, const float *emb, int T, int pos0) {
     const q35_cfg *c = &m->c;
     q35_pfbuf *b = pf_get(m);
     const int D = c->n_embd;
-    for (int t = 0; t < T; t++) embed(m, tokens[t], b->X + (size_t)t * D);
+    if (emb) memcpy(b->X, emb, (size_t)T * D * 4);
+    else for (int t = 0; t < T; t++) embed(m, tokens[t], b->X + (size_t)t * D);
     for (int l = 0; l < c->n_layer; l++) {
         const q35_layer *L = &m->layers[l];
         #pragma omp parallel for schedule(static)
@@ -1783,8 +1796,22 @@ float *q35_prefill(q35_model *m, const int *tokens, int n, int pos0) {
     while (done < n - 1) {
         int T = n - 1 - done;
         if (T > Q35_PF_T) T = Q35_PF_T;
-        pf_chunk(m, tokens + done, T, pos0 + done);
+        pf_chunk(m, tokens + done, NULL, T, pos0 + done);
         done += T;
     }
     return q35_forward(m, tokens[n - 1], pos0 + n - 1);
+}
+
+void q35_prefill_embd(q35_model *m, const float *emb, int n, int row0, const int *rp) {
+    const int D = m->c.n_embd;
+    int *crp = malloc(sizeof(int) * 3 * Q35_PF_T);
+    for (int done = 0; done < n;) {
+        const int T = n - done < Q35_PF_T ? n - done : Q35_PF_T;
+        for (int k = 0; k < 3; k++) memcpy(crp + k * T, rp + k * n + done, sizeof(int) * T);
+        m->pf_rp = crp;
+        pf_chunk(m, NULL, emb + (size_t)done * D, T, row0 + done);
+        m->pf_rp = NULL;
+        done += T;
+    }
+    free(crp);
 }

@@ -8,6 +8,10 @@ ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libllama.so),)
 LLAMA_FLAGS = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -L$(LLAMA_DIR)/build/bin -Wl,-rpath,$(abspath $(LLAMA_DIR)/build/bin)
 endif
 LLAMA_LIBS = $(LLAMA_FLAGS) -lllama -lggml -lggml-base
+# vision (Qwen3.5/3.6 images): llama.cpp's libmtmd, when it has been built
+ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libmtmd.so),)
+LLAMA_LIBS += -I$(LLAMA_DIR)/tools/mtmd -lmtmd -DQUARRY_VISION
+endif
 CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c
 
 all: build/quarry build/quarry-bench build/quarry-info

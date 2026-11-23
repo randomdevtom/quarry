@@ -94,8 +94,8 @@ echo 'int main(void){return 0;}' | gcc -fopenmp -x c - -o /dev/null 2>/dev/null 
 ok "build tools: gcc $(gcc -dumpversion), cmake, git, curl"
 
 # ---------- 2. llama.cpp (tokenizer library) ----------
-step "Building the tokenizer library (llama.cpp)"
-if [ -f "$LLAMA_DIR/build/bin/libllama.so" ]; then
+step "Building the tokenizer and image libraries (llama.cpp)"
+if [ -f "$LLAMA_DIR/build/bin/libllama.so" ] && [ -f "$LLAMA_DIR/build/bin/libmtmd.so" ]; then
   ok "already built ($LLAMA_DIR)"
 else
   if [ ! -d "$LLAMA_DIR/.git" ]; then
@@ -106,11 +106,11 @@ else
   git -C "$LLAMA_DIR" fetch -q --depth 1 origin "$LLAMA_COMMIT"
   git -C "$LLAMA_DIR" checkout -q FETCH_HEAD
   cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=ON \
-        -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+        -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=OFF \
         -DLLAMA_CURL=OFF >/dev/null
   printf '   %sthis takes a few minutes…%s\n' "$D" "$N"
-  cmake --build "$LLAMA_DIR/build" --target llama -j "$(nproc)" >/dev/null
-  ok "built libllama"
+  cmake --build "$LLAMA_DIR/build" --target llama mtmd -j "$(nproc)" >/dev/null
+  ok "built libllama and libmtmd (images)"
 fi
 
 # ---------- 3. Quarry ----------

@@ -141,6 +141,19 @@ details.think .tx { padding: 0 14px 10px; color: var(--dim); font-size: 13.5px; 
 
 /* composer */
 #comp { padding: 8px 22px 16px; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+#att { display: none; max-width: 800px; margin: 0 auto 8px; gap: 8px; flex-wrap: wrap; }
+#att.on { display: flex; }
+.thumb { position: relative; width: 64px; height: 64px; border-radius: 10px; overflow: hidden; border: 1px solid var(--line2); background: var(--raise); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb button { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border-radius: 50%; border: 0; padding: 0;
+                background: rgba(0,0,0,.65); color: #fff; font-size: 12px; line-height: 20px; }
+#attach { flex: none; width: 38px; height: 38px; border-radius: 11px; border: 0; background: none; color: var(--dim); display: grid; place-items: center; }
+#attach:hover { color: var(--text); background: var(--raise); }
+#attach[hidden] { display: none; }
+#comp.drag .box { border-color: var(--ore); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ore) 25%, transparent); }
+.m.user { flex-direction: column; align-items: flex-end; gap: 6px; }
+.uimgs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; max-width: 82%; }
+.uimgs img { max-width: 220px; max-height: 220px; border-radius: 12px; border: 1px solid var(--line); display: block; cursor: zoom-in; }
 #comp .box { max-width: 800px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px; background: var(--panel);
              border: 1px solid var(--line2); border-radius: 16px; padding: 8px 8px 8px 14px; }
 #comp .box:focus-within { border-color: var(--ore2); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ore) 15%, transparent); }
@@ -221,7 +234,10 @@ details.think .tx { padding: 0 14px 10px; color: var(--dim); font-size: 13.5px; 
   </div>
   <div id="log"><div class="col" id="msgs"></div></div>
   <div id="comp">
+    <div id="att" aria-label="Attached images"></div>
     <div class="box">
+      <button id="attach" aria-label="Attach images" title="Attach images (or paste / drop them)" hidden><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/></svg></button>
+      <input type="file" id="file" accept="image/*" multiple hidden>
       <textarea id="in" rows="1" placeholder="Message Quarry…" autocomplete="off"></textarea>
       <button id="send" aria-label="Send" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
     </div>
@@ -290,7 +306,8 @@ function frame(kind, code) {
 }
 function openFull(kind, code) {
   const el = $("full");
-  el.querySelector(".lbl").textContent = kind === "svg" ? "SVG preview" : "HTML preview";
+  el.querySelector(".lbl").textContent = kind === "img" ? "Image" : kind === "svg" ? "SVG preview" : "HTML preview";
+  if (kind === "img") code = '<img src="' + code + '" style="max-width:100%;max-height:100vh;display:block;margin:auto">';
   const old = el.querySelector("iframe"); if (old) old.remove();
   el.appendChild(frame(kind, code));
   el.classList.add("on");
@@ -342,7 +359,19 @@ function md(src) {
 // ---------- conversations ----------
 const now = () => Date.now();
 function conv() { return convs.find(c => c.id === cur); }
-let save = function () { store.set("convs", convs.slice(0, 200)); store.set("cur", cur); };
+let save = function () {
+  // images can fill the browser's storage: if a save fails, drop images from older chats and retry
+  const put = () => { try { localStorage.setItem("quarry.convs", JSON.stringify(convs.slice(0, 200))); return true; } catch (e) { return false; } };
+  if (!put()) {
+    for (let i = convs.length - 1; i >= 0; i--) {
+      if (convs[i].id === cur) continue;
+      let had = false;
+      for (const x of convs[i].msgs) if (x.images) { delete x.images; x.content = (x.content ? x.content + " " : "") + "[image]"; had = true; }
+      if (had && put()) break;
+    }
+  }
+  store.set("cur", cur);
+};
 function newChat() {
   stopGen();
   cur = null; save(); renderSide(); renderMsgs(); closeSide();
@@ -398,7 +427,16 @@ function renderMsgs() {
 }
 function msgEl(m, isLast) {
   const d = document.createElement("div");
-  if (m.role === "user") { d.className = "m user"; d.innerHTML = '<div class="b"></div>'; d.firstChild.textContent = m.content; return d; }
+  if (m.role === "user") {
+    d.className = "m user";
+    if (m.images && m.images.length) {
+      const g = document.createElement("div"); g.className = "uimgs";
+      for (const u of m.images) { const im = document.createElement("img"); im.src = u; im.alt = "Attached image"; im.onclick = () => openFull("img", u); g.appendChild(im); }
+      d.appendChild(g);
+    }
+    if (m.content) { const b = document.createElement("div"); b.className = "b"; b.textContent = m.content; d.appendChild(b); }
+    return d;
+  }
   d.className = "m asst";
   d.innerHTML = '<div class="who">' + logo(16) + 'Quarry</div><div class="body"></div>';
   fillAsst(d, m, false, isLast);
@@ -454,17 +492,19 @@ function regen() {
   const c = conv(); if (!c || busy) return;
   if (c.msgs.length && c.msgs[c.msgs.length - 1].role === "assistant") c.msgs.pop();
   const u = c.msgs.pop(); save(); renderMsgs();
-  if (u) send(u.content);
+  if (u) send(u.content, u.images || []);
 }
-async function send(text) {
+async function send(text, images) {
   if (busy) return;
+  images = images || [];
   let c = conv();
-  if (!c) { c = {id: Math.random().toString(36).slice(2), title: text.replace(/\s+/g, " ").slice(0, 60), msgs: [], t: now()}; convs.unshift(c); cur = c.id; }
-  c.msgs.push({role: "user", content: text});
+  if (!c) { c = {id: Math.random().toString(36).slice(2), title: (text || "Image").replace(/\s+/g, " ").slice(0, 60), msgs: [], t: now()}; convs.unshift(c); cur = c.id; }
+  c.msgs.push(images.length ? {role: "user", content: text, images} : {role: "user", content: text});
   c.t = now();
   convs = [c, ...convs.filter(x => x !== c)];
   save(); renderSide(); renderMsgs();
-  const m = {role: "assistant", content: "", think: "", status: "Reading your message…"};
+  const looking = c.msgs.some(x => x.images && x.images.length);
+  const m = {role: "assistant", content: "", think: "", status: looking ? "Looking at the image…" : "Reading your message…"};
   const el = msgEl(m, true); fillAsst(el, m, true); $("msgs").appendChild(el); stick = true; scrollDown(true);
   const ctl = new AbortController(); setBusy(ctl);
   const job = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -472,13 +512,15 @@ async function send(text) {
   const t0 = performance.now();
   let tFirst = 0, ntok = 0, usage = null, last = 0, finished = false;
   const tick = setInterval(() => {
-    if (!tFirst) { m.status = "Reading your message… " + ((performance.now() - t0) / 1000).toFixed(0) + "s"; fillAsst(el, m, true); }
+    if (!tFirst) { m.status = (looking ? "Looking at the image… " : "Reading your message… ") + ((performance.now() - t0) / 1000).toFixed(0) + "s"; fillAsst(el, m, true); }
   }, 1000);
   const draw = () => { const t = performance.now(); if (t - last > 60) { last = t; fillAsst(el, m, true); scrollDown(); } };
   try {
     const msgs = [];
     if (settings.sys.trim()) msgs.push({role: "system", content: settings.sys.trim()});
-    for (const x of c.msgs) msgs.push({role: x.role, content: x.content});
+    for (const x of c.msgs) msgs.push(x.images && x.images.length
+      ? {role: x.role, content: [...x.images.map(u => ({type: "image_url", image_url: {url: u}})), {type: "text", text: x.content || "Describe this image."}]}
+      : {role: x.role, content: x.content});
     const r = await fetch("v1/chat/completions", {
       method: "POST", headers: {"Content-Type": "application/json"}, signal: ctl.signal,
       body: JSON.stringify({model: "quarry", stream: true, temperature: settings.temp, max_tokens: settings.max,
@@ -566,6 +608,7 @@ async function stats() {
     $("ehitbar").style.width = (100 * s.cache_hit) + "%";
     $("ecache").textContent = s.cache_gb.toFixed(1) + " GB";
     $("essd").textContent = s.ssd_gb.toFixed(1) + " GB";
+    $("attach").hidden = !s.vision;
     $("eacc").textContent = s.speculative ? (s.draft_accept ? (100 * s.draft_accept).toFixed(0) + "%" : "on") : "off";
     if (s.last && s.last.gen_s > 0 && $("cgen").textContent.startsWith("–")) $("cgen").innerHTML = "<b>" + (s.last.gen_tokens / s.last.gen_s).toFixed(1) + "</b> tok/s";
   } catch (e) {
@@ -595,7 +638,7 @@ $("scrim").onclick = () => { openDrawer(false); closeSide(); };
 $("newchat").onclick = newChat;
 $("in").addEventListener("input", () => {
   const t = $("in"); t.style.height = "auto"; t.style.height = t.scrollHeight + "px";
-  if (!busy) $("send").disabled = !t.value.trim();
+  if (!busy) $("send").disabled = !t.value.trim() && !pending.length;
 });
 $("in").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
@@ -603,10 +646,52 @@ $("in").addEventListener("keydown", e => {
 $("send").onclick = submit;
 function submit() {
   if (busy) { stopGen(); return; }
-  const t = $("in").value.trim(); if (!t) return;
+  const t = $("in").value.trim(); if (!t && !pending.length) return;
+  const imgs = pending; pending = []; renderAtt();
   $("in").value = ""; $("in").style.height = ""; $("send").disabled = true;
-  send(t);
+  send(t, imgs);
 }
+
+// ---------- images: attach, paste, drop. Downscaled here (the model sees ~256 tokens anyway) ----------
+let pending = [];
+function renderAtt() {
+  const el = $("att"); el.innerHTML = "";
+  el.classList.toggle("on", pending.length > 0);
+  pending.forEach((u, i) => {
+    const d = document.createElement("div"); d.className = "thumb";
+    d.innerHTML = '<img alt="Attached image"><button aria-label="Remove image">✕</button>';
+    d.querySelector("img").src = u;
+    d.querySelector("button").onclick = () => { pending.splice(i, 1); renderAtt(); };
+    el.appendChild(d);
+  });
+  if (!busy) $("send").disabled = !$("in").value.trim() && !pending.length;
+}
+function addImage(file) {
+  if (!file || !/^image\//.test(file.type) || pending.length >= 4) return;
+  const r = new FileReader();
+  r.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 1024 / Math.max(img.width, img.height));
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.round(img.width * k)); cv.height = Math.max(1, Math.round(img.height * k));
+      const g = cv.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, cv.width, cv.height);
+      g.drawImage(img, 0, 0, cv.width, cv.height);
+      pending.push(cv.toDataURL("image/jpeg", 0.88)); renderAtt();
+    };
+    img.src = r.result;
+  };
+  r.readAsDataURL(file);
+}
+$("attach").onclick = () => $("file").click();
+$("file").onchange = e => { for (const f of e.target.files) addImage(f); e.target.value = ""; };
+$("in").addEventListener("paste", e => {
+  const files = [...(e.clipboardData && e.clipboardData.files || [])].filter(f => /^image\//.test(f.type));
+  if (files.length && !$("attach").hidden) { e.preventDefault(); files.forEach(addImage); }
+});
+["dragenter", "dragover"].forEach(t => $("comp").addEventListener(t, e => { if ($("attach").hidden) return; e.preventDefault(); $("comp").classList.add("drag"); }));
+["dragleave", "drop"].forEach(t => $("comp").addEventListener(t, () => $("comp").classList.remove("drag")));
+$("comp").addEventListener("drop", e => { if ($("attach").hidden) return; e.preventDefault(); [...e.dataTransfer.files].forEach(addImage); });
 document.addEventListener("keydown", e => { if (e.key === "Escape") { closeFull(); openDrawer(false); closeSide(); } });
 $("fclose").onclick = closeFull;
 
