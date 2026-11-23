@@ -1144,6 +1144,23 @@ static int serve_poll(req_ctx *r) {
             const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
             send(c, resp, strlen(resp), MSG_NOSIGNAL);
             close(c);
+        } else if (!strncmp(path, "/v1/job?partial=1&id=", 21) && r->job[0] && !strcmp(path + 21, r->job)) {
+            // the chat page coming back (phone woke up, tab reloaded): the reply so far, while it is
+            // still being written
+            { char drain[512]; (void)!recv(c, drain, sizeof drain, 0); }   // consume the request (it was only peeked)
+            const char *ct = r->acc ? r->acc : "", *rt = r->racc ? r->racc : "";
+            size_t lc = strlen(ct), lr = strlen(rt);
+            char *ec = malloc(lc * 6 + 16), *er = malloc(lr * 6 + 16);
+            json_escape(ct, ec, lc * 6 + 16);
+            json_escape(rt, er, lr * 6 + 16);
+            size_t cap = strlen(ec) + strlen(er) + 256;
+            char *body = malloc(cap), hdr[256];
+            int bl = snprintf(body, cap, "{\"id\":\"%s\",\"done\":false,\"content\":\"%s\",\"reasoning\":\"%s\"}", r->job, ec, er);
+            int hn = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n", bl);
+            send_all(c, hdr, hn);
+            send_all(c, body, bl);
+            free(ec); free(er); free(body);
+            close(c);
         } else if (!strcmp(method, "GET") && strncmp(path, "/v1/job", 7)) {
             // the page, health, stats, models: answer now (they don't generate) so the site
             // still opens while a long reply is being written
