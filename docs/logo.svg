@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="256" height="256">
+  <title>Quarry</title>
+  <!-- a block lifted out of the top stratum: an expert pulled from storage into use -->
+  <rect x="12" y="1.5" width="8" height="6.5" rx="1.4" fill="#f0b85c" transform="rotate(-14 16 4.75)"/>
+    <rect x="1.5" y="11" width="10" height="6" rx="1.4" fill="#d79a4a"/>
+    <rect x="20.5" y="11" width="10" height="6" rx="1.4" fill="#d79a4a"/>
+    <rect x="11.5" y="15" width="9" height="2" fill="#b8823f"/>
+    <rect x="4.5" y="19" width="23" height="5" rx="1.4" fill="#a8743a"/>
+    <rect x="8.5" y="26" width="15" height="4" rx="1.4" fill="#6f5130"/>
+</svg>

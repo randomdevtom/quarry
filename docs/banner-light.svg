@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" width="520" height="120">
+  <title>Quarry</title>
+  <g transform="translate(8 12) scale(3)">
+    <rect x="12" y="1.5" width="8" height="6.5" rx="1.4" fill="#f0b85c" transform="rotate(-14 16 4.75)"/>
+    <rect x="1.5" y="11" width="10" height="6" rx="1.4" fill="#d79a4a"/>
+    <rect x="20.5" y="11" width="10" height="6" rx="1.4" fill="#d79a4a"/>
+    <rect x="11.5" y="15" width="9" height="2" fill="#b8823f"/>
+    <rect x="4.5" y="19" width="23" height="5" rx="1.4" fill="#a8743a"/>
+    <rect x="8.5" y="26" width="15" height="4" rx="1.4" fill="#6f5130"/>
+  </g>
+  <text x="122" y="70" font-family="'Space Grotesk','Inter','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="56" font-weight="700" letter-spacing="-1.5" fill="#2b2420">Quarry</text>
+  <text x="124" y="98" font-family="'Inter','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="16" fill="#7a6a5c">MoE models bigger than your RAM, on a CPU</text>
+</svg>

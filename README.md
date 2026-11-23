@@ -1,4 +1,15 @@
-# Quarry
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.svg">
+    <img src="docs/banner-light.svg" alt="Quarry" width="460">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://github.com/randomdevtom/quarry/actions/workflows/build.yml"><img src="https://github.com/randomdevtom/quarry/actions/workflows/build.yml/badge.svg" alt="build"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-d79a4a" alt="MIT license"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.3.0-a8743a" alt="version 0.3.0"></a>
+</p>
 
 CPU-only inference for Mixture-of-Experts models that are **bigger than your RAM**.
 
@@ -215,7 +226,7 @@ laptop like this one. Later turns reuse the cached prefix and only process what'
   by file offset.
 - `src/main.c`: CLI and HTTP server (chat templates, tool calling, streaming).
 
-`RESEARCH.md` has the measurements, the routing-trace and cache-simulation work behind
+[`docs/research.md`](docs/research.md) has the measurements, the routing-trace and cache-simulation work behind
 the design, and what didn't help. `research/code_bench2.py` runs HumanEval, HumanEval+
 and MBPP against a running server.
 

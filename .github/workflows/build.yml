@@ -1,0 +1,27 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential xxd
+      # Compile only: the runner may lack AVX-512, and the main binary needs libllama
+      # (tokenizer), so build the engine core through the bench, info and kernel-test tools.
+      - name: Build engine core, tools and kernel tests
+        working-directory: quarry
+        env:
+          F: -O2 -march=icelake-client -fopenmp -Wall
+        run: |
+          make build/quarry-bench build/quarry-info src/chat_html.h CFLAGS="$F"
+          CORE="src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c"
+          gcc $F $CORE tests/test_quants.c -o build/test_quants -lm -lpthread
+          gcc $F $CORE tests/test_forward.c -o build/test_forward -lm -lpthread
+          gcc $F $CORE tests/test_q35.c -o build/test_q35 -lm -lpthread
+          gcc $F src/qgguf.c src/quants.c tests/test_quants2.c -o build/test_quants2 -lm
