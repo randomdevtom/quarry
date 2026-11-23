@@ -63,6 +63,8 @@ typedef struct {
     ink_model im;
     q35_model qm;
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
+    float spec_rate;                   // running draft acceptance (MTP); drafting pauses when low
+    int spec_idle;                     // tokens generated since drafting paused
     void *mctx;                        // mtmd vision context (Qwen3.5/3.6 + mmproj), NULL if none
     int snap_delta;                    // q35: RoPE position offset at the snapshot
     int t_im_start;                    // "<|im_start|>": the snapshot is taken before the last one
@@ -401,6 +403,10 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     // Qwen3.5/3.6 with an MTP layer: draft one token, verify two at a time (output unchanged:
     // greedy keeps the draft only if it is the argmax; sampling uses the speculative rule)
     const int spec = e->q35 && e->qm.has_mtp && !getenv("QUARRY_NO_SPEC");
+    // a draft costs ~a tenth of a step and saves a step only when accepted: below ~65% acceptance
+    // (e.g. a fine-tune whose MTP layer was left untrained) drafting is slower than plain decoding.
+    // Track acceptance; while it is low, decode normally and retry a draft every 64 tokens.
+    if (e->spec_rate == 0) e->spec_rate = 0.8f;
     while (g < max_tokens) {
         int tok = sample(e, lg, temp, top_p);
         if (is_eog(e, tok)) break;
@@ -408,7 +414,9 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
         g++;
         if (stop) break;
         e->ctx_tokens[pos] = tok;
-        if (spec && g < max_tokens && pos + 2 < e->n_ctx) {
+        const int use_spec = spec && (e->spec_rate >= 0.65f || ++e->spec_idle >= 64 || getenv("QUARRY_SPEC_ALWAYS"));
+        if (use_spec && g < max_tokens && pos + 2 < e->n_ctx) {
+            e->spec_idle = 0;
             const int d = q35_draft(&e->qm, tok, pos);
             q35_forward2(&e->qm, tok, d, pos);
             float *l0 = e->qm.logits2[0], *l1 = e->qm.logits2[1];
@@ -422,6 +430,7 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
                 if (!acc) l0[d] = -INFINITY;   // resample from the rest
             }
             q35_commit(&e->qm, acc);
+            e->spec_rate = 0.95f * e->spec_rate + 0.05f * (acc ? 1.0f : 0.0f);
             if (acc) {
                 e->ctx_tokens[pos + 1] = d;
                 pos += 2;
@@ -1486,6 +1495,46 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         if (fi) fclose(fi);
     }
     if (n <= 0 || n >= e->n_ctx) { fprintf(stderr, "prompt has %d tokens, ctx %d\n", n, e->n_ctx); return 1; }
+    if (e->ink && (getenv("QUARRY_KL_SAVE") || getenv("QUARRY_KL_REF"))) {
+        // teacher-forced quality check: per position, the reference's top 64 log-probs; a later
+        // run reports KL(reference || this run) over them and how often the top token agrees
+        enum { TK = 64 };
+        const int nv = n_vocab(e);
+        const char *sv = getenv("QUARRY_KL_SAVE");
+        FILE *f2 = fopen(sv ? sv : getenv("QUARRY_KL_REF"), sv ? "wb" : "rb");
+        if (!f2) { fprintf(stderr, "cannot open the KL file\n"); return 1; }
+        double kl = 0, t0 = now(); int agree = 0, cnt = 0;
+        for (int i = 0; i < n; i++) {
+            const float *lg = ink_forward(&e->im, toks[i], i);
+            double mx = lg[0], z = 0;
+            for (int v = 1; v < nv; v++) if (lg[v] > mx) mx = lg[v];
+            for (int v = 0; v < nv; v++) z += exp(lg[v] - mx);
+            const double lz = mx + log(z);
+            int am = 0;
+            for (int v = 1; v < nv; v++) if (lg[v] > lg[am]) am = v;
+            if (sv) {
+                int id[TK]; float lp[TK]; int k = 0;
+                for (int v = 0; v < nv; v++) {   // insertion into a sorted top-TK list
+                    if (k < TK || lg[v] > lp[k - 1] + lz) {
+                        int j = k < TK ? k++ : TK - 1;
+                        while (j > 0 && lp[j - 1] < lg[v] - lz) { lp[j] = lp[j - 1]; id[j] = id[j - 1]; j--; }
+                        lp[j] = lg[v] - lz; id[j] = v;
+                    }
+                }
+                fwrite(id, 4, TK, f2); fwrite(lp, 4, TK, f2);
+            } else {
+                int id[TK]; float lp[TK];
+                if (fread(id, 4, TK, f2) != TK || fread(lp, 4, TK, f2) != TK) break;
+                for (int j = 0; j < TK; j++) kl += exp(lp[j]) * (lp[j] - (lg[id[j]] - lz));
+                agree += am == id[0]; cnt++;
+            }
+        }
+        fclose(f2);
+        if (sv) printf("saved reference for %d tokens (%.1fs)\n", n, now() - t0);
+        else printf("vs reference: mean KL %.4f, top token agrees %.1f%% (%d tokens, %.1fs, %.2f tok/s)\n", kl / cnt, 100.0 * agree / cnt, cnt, now() - t0, cnt / (now() - t0));
+        free(toks);
+        return 0;
+    }
     for (int run = 0; run < 2; run++) {
         memset(qt_pf, 0, sizeof qt_pf);
         memset(q35_prof, 0, sizeof q35_prof); memset(q35_mp, 0, sizeof q35_mp);

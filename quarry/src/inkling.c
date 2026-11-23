@@ -88,6 +88,7 @@ int ink_load(ink_model *m, const char *path, int n_ctx) {
     c->hd = qg_get_int(g, K("attention.key_length"), 128);
     c->n_expert = qg_get_int(g, K("expert_count"), 0);
     c->n_used = qg_get_int(g, K("expert_used_count"), 0);
+    if (getenv("QUARRY_TOPK") && atoi(getenv("QUARRY_TOPK")) > 0 && atoi(getenv("QUARRY_TOPK")) < c->n_used) c->n_used = atoi(getenv("QUARRY_TOPK"));   // lossy
     c->n_ff = qg_get_int(g, K("expert_feed_forward_length"), 0);
     c->n_vocab = qg_get_int(g, K("vocab_size_unpadded"), 0);
     c->n_vocab_pad = qg_get_int(g, K("vocab_size"), 0);
@@ -395,7 +396,7 @@ typedef struct {
     float *in[3], *q, *k, *v, *r, *dk, *dv, *sink, *att, *gate, *o, *tab, *sc, *mixed, *h, *moe, *eo, *gu, *act;
     block_q8_K *kq[3];
     int8_t *aq[3]; float *ad[3]; int32_t *as[3];
-    float *gub, *actb, *eob, *adb; block_q8_K *kqb; int8_t *aqb; int32_t *asb;   // batched experts
+    float *gub, *actb, *eob, *eok, *adb; block_q8_K *kqb; int8_t *aqb; int32_t *asb;   // batched experts
 } ink_scratch;
 
 static ink_scratch *scratch(const ink_cfg *c) {
@@ -417,7 +418,7 @@ static ink_scratch *scratch(const ink_cfg *c) {
     S.mixed = xalloc(3 * D * 4); S.h = xalloc(D * 4); S.moe = xalloc(D * 4); S.eo = xalloc(D * 4);
     S.gu = xalloc(2 * c->n_ff * 4); S.act = xalloc(c->n_ff * 4);
     const int F = c->n_ff;
-    S.gub = xalloc((size_t)16 * 2 * F * 4); S.actb = xalloc((size_t)16 * F * 4); S.eob = xalloc((size_t)16 * D * 4);
+    S.gub = xalloc((size_t)16 * 2 * F * 4); S.actb = xalloc((size_t)16 * F * 4); S.eob = xalloc((size_t)16 * D * 4); S.eok = xalloc((size_t)16 * D * 4);
     S.kqb = xalloc(sizeof(block_q8_K) * 16 * (F / QK_K + 1));
     S.aqb = xalloc((size_t)16 * F); S.adb = xalloc((size_t)16 * (F / 32) * 4); S.asb = xalloc((size_t)16 * (F / 32) * 4);
     return &S;
@@ -509,6 +510,16 @@ static void moe(ink_model *m, int phys, const float *x, const float *resid, floa
             if (pf_k < 0) pf_k = getenv("QUARRY_PF_K") ? atoi(getenv("QUARRY_PF_K")) : 2;
             experts_prefetch(m->experts, np, m->pred[st + 1], pf_k < K ? pf_k : K);
         }
+        static int pf_a = -1;   // also guess two steps ahead (more lead time for the SSD)
+        if (pf_a < 0) pf_a = getenv("QUARRY_PF_AHEAD") ? atoi(getenv("QUARRY_PF_AHEAD")) : 0;
+        if (pf_a > 0 && st + 2 < m->n_steps) {
+            const int np2 = m->seq[st + 2];
+            float *xn = S->eo, pw[16];
+            int g2[16];
+            rmsnorm(xn, resid, m->layers[np2].ffn_norm, D, c->eps);
+            route(c, &m->layers[np2], xn, g2, pw);
+            experts_prefetch(m->experts, np2, g2, pf_a < K ? pf_a : K);
+        }
     }
     qin qx;
     qin_init(&qx, x, D, S->kq[0], S->aq[0], S->ad[0], S->as[0]);
@@ -546,11 +557,15 @@ static void moe(ink_model *m, int phys, const float *x, const float *resid, floa
         }
         for (int j = 0; j < nb; j++) {
             experts_release(m->experts, phys, sel[bl[j]]);
-            const float wj = w[bl[j]];
-            for (int i = 0; i < D; i++) out[i] += wj * EO[(size_t)j * D + i];
+            memcpy(S->eok + (size_t)bl[j] * D, EO + (size_t)j * D, D * 4);
             done[bl[j]] = 1;
             ndone++;
         }
+    }
+    // sum in routing order, whatever order the experts arrived in (same result every run)
+    for (int q = 0; q < K; q++) {
+        const float wq = w[q], *eq = S->eok + (size_t)q * D;
+        for (int i = 0; i < D; i++) out[i] += wq * eq[i];
     }
 }
 

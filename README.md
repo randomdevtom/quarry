@@ -59,6 +59,9 @@ Qwen3.6-style hybrid: 30 Gated DeltaNet layers + 10 gated attention layers, 256 
   verifies two tokens per pass (weight rows unpacked once for both tokens). ~90% of drafts are
   accepted on code; greedy output is unchanged, sampling uses the standard speculative rule.
   HumanEval subset with speculation: 20/21, 44s/task
+- drafting is adaptive: when fewer than ~65% of drafts are accepted (e.g. Ornith 1.5, a
+  fine-tune that ships the base model's MTP layer: 45%), Quarry decodes normally and retries a
+  draft every 64 tokens. Ornith 1.5: 5.5 -> 6.2 tok/s
 - thinking is off by default; `--think` or `"chat_template_kwargs": {"enable_thinking": true}`
 - the output layer (248K vocab) runs from a 4-bit copy that picks 64 candidates, whose exact
   logits are computed from the file's rows (`QUARRY_EXACT_OUTPUT=1` keeps the full matrix in RAM)
