@@ -597,7 +597,19 @@ async function recover(job, m, el) {
 }
 // the page was reloaded (or the tab discarded) while a reply was being written: pick it up again
 async function resumePending() {
-  const c = convs.find(x => x.pending);
+  let c = convs.find(x => x.pending);
+  if (!c) {
+    // no saved job id (e.g. the question was sent from an older version of this page): a chat whose
+    // last message is an unanswered question may match the server's last reply
+    try {
+      const r = await fetch("v1/job?last=1", {cache: "no-store"});
+      if (r.ok) {
+        const j = await r.json();
+        c = convs.find(x => { const l = x.msgs[x.msgs.length - 1]; return l && l.role === "user" && (l.content || "").slice(0, 300) === j.question; });
+        if (c) { c.pending = j.id; save(); }
+      }
+    } catch (e) {}
+  }
   if (!c || busy) return;
   if (cur !== c.id) { cur = c.id; renderSide(); renderMsgs(); }
   const job = c.pending;

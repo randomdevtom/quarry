@@ -78,6 +78,7 @@ typedef struct {
     int listen_fd, pend_fd[32], n_pend;
     char job_id[64], *job_content, *job_reason, job_finish[16];
     int job_prompt_tokens, job_gen_tokens, job_cancelled;
+    char *job_q, job_running[64];                       // the last chat-page request's question (start of the last user message)
     double job_t_prompt, job_t_gen;
     int t_think_end, think, think_default;   // q35: "</think>" token; thinking on for this request / by default
     // Inkling special tokens and output state (0 header, 1 thinking, 2 answer text)
@@ -1123,6 +1124,27 @@ static void acc_add(char **b, size_t *len, size_t *cap, const char *t, size_t l)
 
 static void handle(engine *e, int fd);
 
+// GET /v1/job?last=1: id and question of the last chat-page request, running or finished
+static void send_last_job(engine *e, int fd, int running) {
+    const char *id = running ? e->job_running : e->job_id;
+    char hdr[256];
+    if (!id[0] || !e->job_q) {
+        const char *b = "{\"error\":\"no job\"}";
+        int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %zu\r\n\r\n%s", strlen(b), b);
+        send_all(fd, hdr, n);
+        return;
+    }
+    size_t lq = strlen(e->job_q);
+    char *eq = malloc(lq * 6 + 16);
+    json_escape(e->job_q, eq, lq * 6 + 16);
+    char *b = malloc(strlen(eq) + 160);
+    int bl = sprintf(b, "{\"id\":\"%s\",\"done\":%s,\"question\":\"%s\"}", id, running ? "false" : "true", eq);
+    int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n", bl);
+    send_all(fd, hdr, n);
+    send_all(fd, b, bl);
+    free(eq); free(b);
+}
+
 // called between tokens: take connections that arrived meanwhile. A cancel for this request stops
 // it; anything else waits in e->pend_fd until the generation ends.
 static int serve_poll(req_ctx *r) {
@@ -1143,6 +1165,10 @@ static int serve_poll(req_ctx *r) {
             if (!id || !r->job[0] || !strcmp(id + 3, r->job)) r->cancelled = 1;
             const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
             send(c, resp, strlen(resp), MSG_NOSIGNAL);
+            close(c);
+        } else if (!strcmp(path, "/v1/job?last=1") && r->job[0]) {
+            { char drain[512]; (void)!recv(c, drain, sizeof drain, 0); }
+            send_last_job(e, c, 1);
             close(c);
         } else if (!strncmp(path, "/v1/job?partial=1&id=", 21) && r->job[0] && !strcmp(path + 21, r->job)) {
             // the chat page coming back (phone woke up, tab reloaded): the reply so far, while it is
@@ -1297,6 +1323,8 @@ static void handle(engine *e, int fd) {
         const char *b = "{\"ok\":true}";
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\n\r\n%s", cors, strlen(b), b);
         send_all(fd, hdr, n);
+    } else if (!strcmp(path, "/v1/job?last=1")) {
+        send_last_job(e, fd, 0);
     } else if (!strncmp(path, "/v1/job", 7)) {
         // the kept reply of a chat-page request (requests are served in order, so it is finished)
         const char *id = strstr(path, "id=");
@@ -1385,6 +1413,11 @@ static void handle(engine *e, int fd) {
         rc.e = e;
         if ((v = json_get(body, "quarry_job"))) { char *j = json_str(skip_ws(v), NULL); if (j) { snprintf(rc.job, sizeof rc.job, "%s", j); free(j); } }
         for (char *c = rc.job; *c; c++) if (!isalnum((unsigned char)*c)) *c = '_';
+        if (rc.job[0]) {   // remembered so a reloaded page that lost the job id can still find the reply
+            free(e->job_q); e->job_q = NULL;
+            for (int i = nm - 1; i >= 0; i--) if (!strcmp(roles[i], "user")) { e->job_q = strndup(contents[i], 300); break; }
+            snprintf(e->job_running, sizeof e->job_running, "%s", rc.job);
+        }
         if (stream) {
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%s\r\n", cors);
             send_all(fd, hdr, n);
