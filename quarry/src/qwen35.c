@@ -47,14 +47,14 @@ static int sp_cfg(int which) {
     return v[which];
 }
 
-// KV cache memory. Long contexts (over 64K rows, or QUARRY_KV_FILE=1) map an unlinked file in
+// KV cache memory. Caches of 64MB and more (QUARRY_KV_FILE=0: plain RAM) map an unlinked file in
 // $XDG_CACHE_HOME/quarry (~/.cache/quarry): pages are only used once written, and under memory
 // pressure the kernel writes cold ones back to the SSD instead of swapping, while sparse
 // attention keeps touching only the selected blocks.
 static void *kv_alloc(size_t n) {
     static int file = -1;
     if (file < 0) file = getenv("QUARRY_KV_FILE") ? atoi(getenv("QUARRY_KV_FILE")) : -2;
-    if (file == 0 || (file == -2 && n < (size_t)65536 * 1024)) return xalloc(n);
+    if (file == 0 || (file == -2 && n < ((size_t)64 << 20))) return xalloc(n);   // any sizeable cache: pages cost RAM only once written
     char dir[512], path[600];
     const char *xc = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
     if (xc) snprintf(dir, sizeof dir, "%s/quarry", xc); else snprintf(dir, sizeof dir, "%s/.cache/quarry", home ? home : "/tmp");
@@ -562,6 +562,29 @@ static void route_pick(float *rl, int ne, int k, int *sel, float *w) {
 }
 
 // routing for a chunk: each bf16 router row is converted once per 8 tokens
+// router logits of two tokens in one pass over the router rows, then the same top-k pick
+static void route2(const q35_layer *L, const float *x0, const float *x1, const q35_cfg *c, int k,
+                   int *sel0, float *w0, int *sel1, float *w1) {
+    if (!L->router) { route(L, x0, c, k, sel0, w0); route(L, x1, c, k, sel1, w1); return; }
+    float r0[512], r1[512];
+    const int D = c->n_embd;
+    #pragma omp parallel for schedule(static)
+    for (int e = 0; e < c->n_expert; e++) {
+        const uint16_t *a = L->router + (size_t)e * D;
+        __m512 s0 = _mm512_setzero_ps(), s1 = s0, t0 = s0, t1 = s0;
+        for (int i = 0; i < D; i += 32) {
+            const __m512 w_a = bf16x16(a + i), w_b = bf16x16(a + i + 16);
+            s0 = _mm512_fmadd_ps(w_a, _mm512_loadu_ps(x0 + i), s0);
+            s1 = _mm512_fmadd_ps(w_b, _mm512_loadu_ps(x0 + i + 16), s1);
+            t0 = _mm512_fmadd_ps(w_a, _mm512_loadu_ps(x1 + i), t0);
+            t1 = _mm512_fmadd_ps(w_b, _mm512_loadu_ps(x1 + i + 16), t1);
+        }
+        r0[e] = _mm512_reduce_add_ps(_mm512_add_ps(s0, s1));
+        r1[e] = _mm512_reduce_add_ps(_mm512_add_ps(t0, t1));
+    }
+    route_pick(r0, c->n_expert, k, sel0, w0);
+    route_pick(r1, c->n_expert, k, sel1, w1);
+}
 static void route_batch(const q35_layer *L, const float *XN, int T, const q35_cfg *c, int k, int *sel, float *wsel) {
     const int D = c->n_embd, NE = c->n_expert;
     if (!L->router || D % 16 || NE > 512) { for (int t = 0; t < T; t++) route(L, XN + (size_t)t * D, c, k, sel + t * k, wsel + t * k); return; }
@@ -817,7 +840,7 @@ void q35_kv_summarize_all(q35_model *m, int rows) {
 // which rows each KV head attends to: m->rl[kvh * n_ctx ..], counts in rn
 static void attn_select(q35_model *m, int ai, const uint16_t *kc, int S, int nq, float *const *qh, int lo, int *rn) {
     const q35_cfg *c = &m->c;
-    const int HD = c->hd, NKV = c->n_head_kv, kvd = NKV * HD, gqa = c->n_head / NKV;
+    const int HD = c->hd, NKV = c->n_head_kv, gqa = c->n_head / NKV;
     if (ai < 0 || lo > 0 || !m->ksum || S < sp_cfg(2)) {
         for (int h = 0; h < NKV; h++) {
             int *rl = m->rl + (size_t)h * c->n_ctx;
@@ -1141,16 +1164,18 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
 // logits for T (1 or 2) normed hidden states. With the 4-bit copy: approximate logits for all
 // rows (each row read once for all tokens), then, if `exact`, the exact logits of the top 64
 // per token from the file's rows.
-static void out_logits(q35_model *m, const float *const *xn, int T, float *const *lg, int exact, scratch **ss) {
+// logits for rows [0, nr) of the output layer (nr < n_vocab: draft head over the most common ids)
+static void out_logits(q35_model *m, const float *const *xn, int T, float *const *lg, int exact, scratch **ss, int nr) {
     const q35_cfg *c = &m->c;
     const int D = c->n_embd;
     const qmat *O = &m->output;
+    if (nr <= 0 || nr > O->rows) nr = O->rows;
     qin q[2];
     for (int t = 0; t < T; t++) qin_init(&q[t], xn[t], D, ss[t]->qk, ss[t]->a_qs, ss[t]->a_d, ss[t]->a_s);
     if (!m->out4) {
         for (int t = 0; t < T; t++) qin_need(&q[t], O->type);
         #pragma omp parallel for schedule(static)
-        for (int r = 0; r < O->rows; r++)
+        for (int r = 0; r < nr; r++)
             for (int t = 0; t < T; t++) lg[t][r] = row_dot(O->type, O->data + (uint64_t)r * O->row_bytes, O->cols, &q[t]);
         return;
     }
@@ -1165,7 +1190,7 @@ static void out_logits(q35_model *m, const float *const *xn, int T, float *const
     }
     const __m512i c128 = _mm512_set1_epi8((char)128), m4 = _mm512_set1_epi8(15), c8 = _mm512_set1_epi8(8);
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < O->rows; r++) {
+    for (int r = 0; r < nr; r++) {
         const uint8_t *row = m->out4 + (size_t)r * rb;
         __m512 acc[2] = {_mm512_setzero_ps(), _mm512_setzero_ps()};
         float off[2] = {0, 0};
@@ -1192,7 +1217,7 @@ static void out_logits(q35_model *m, const float *const *xn, int T, float *const
     for (int t = 0; t < T; t++) {
         float *L = lg[t];
         int cand[NC], nc = 0;
-        for (int r = 0; r < O->rows; r++) {
+        for (int r = 0; r < nr; r++) {
             if (nc < NC || L[r] > L[cand[nc - 1]]) {
                 int j = nc < NC ? nc++ : NC - 1;
                 while (j > 0 && L[cand[j - 1]] < L[r]) { cand[j] = cand[j - 1]; j--; }
@@ -1235,7 +1260,7 @@ float *q35_forward(q35_model *m, int token, int pos) {
     const float *xs[1] = {xn};
     float *ls[1] = {m->logits};
     scratch *ss[1] = {s};
-    out_logits(m, xs, 1, ls, 1, ss);
+    out_logits(m, xs, 1, ls, 1, ss, 0);
     q35_prof[5] += qnow() - t0;
     return m->logits;
 }
@@ -1400,8 +1425,7 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
     int sel[2][16], U[32], nu = 0;
     float w[2][16], uw[32][2];
     double t0 = qnow();
-    route(L, xn0, c, K, sel[0], w[0]);
-    route(L, xn1, c, K, sel[1], w[1]);
+    route2(L, xn0, xn1, c, K, sel[0], w[0], sel[1], w[1]);
     for (int t = 0; t < 2; t++)
         for (int j = 0; j < K; j++) {
             int u = 0;
@@ -1418,8 +1442,8 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
     if (m->prefetch_on && l + 1 < c->n_layer) {   // next layer: union of both tokens' guesses
         int p[2][16], pu[16], npu = 0;
         float pw[16];
-        route(&m->layers[l + 1], xn0, c, K, p[0], pw);
-        route(&m->layers[l + 1], xn1, c, K, p[1], pw);
+        float pw1[16];
+        route2(&m->layers[l + 1], xn0, xn1, c, K, p[0], pw, p[1], pw1);
         for (int j = 0; j < K; j++)
             for (int t = 0; t < 2; t++) {   // interleaved: most likely first
                 int u = 0;
@@ -1544,7 +1568,7 @@ void q35_forward2(q35_model *m, int tok0, int tok1, int pos) {
     double t0 = qnow();
     const float *xs[2] = {m->h2[0], m->h2[1]};
     scratch *ss[2] = {s0, s1};
-    out_logits(m, xs, 2, m->logits2, 1, ss);
+    out_logits(m, xs, 2, m->logits2, 1, ss, 0);
     q35_prof[5] += qnow() - t0;
 }
 
@@ -1597,9 +1621,14 @@ int q35_draft(q35_model *m, int tok, int pos) {
     const float *xs[1] = {xn};
     float *ls[1] = {m->logits2[1]};
     scratch *ss[1] = {s};
-    out_logits(m, xs, 1, ls, 0, ss);
+    // the draft only has to be a good guess: scan the QUARRY_DRAFT_VOCAB lowest ids (BPE ids
+    // roughly follow frequency), a quarter of the output layer
+    static int dv = -1;
+    if (dv < 0) dv = getenv("QUARRY_DRAFT_VOCAB") ? atoi(getenv("QUARRY_DRAFT_VOCAB")) : 65536;
+    const int nv = dv > 0 && dv < c->n_vocab ? dv : c->n_vocab;
+    out_logits(m, xs, 1, ls, 0, ss, nv);
     int best = 0;
-    for (int i = 1; i < c->n_vocab; i++) if (ls[0][i] > ls[0][best]) best = i;
+    for (int i = 1; i < nv; i++) if (ls[0][i] > ls[0][best]) best = i;
     m->draft_seconds += qnow() - t0;
     return best;
 }

@@ -235,7 +235,7 @@ float vec_dot_q3_K_q8_K(int n, const block_q3_K *x, const block_q8_K *y) {
                 __m512i xv = _mm512_loadu_si512((const void *)(y[b].qs + c * 32));
                 __m512i p16 = _mm512_maddubs_epi16(u, xv);
                 __m512i sv = _mm512_permutexvar_epi16(sidx(p), sc16);
-                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p16, sv));
+                acc = _mm512_dpwssd_epi32(acc, p16, sv);
             }
         }
         // offset correction 4 * sum_g sc_g * bsum_g, subtracted in the integer
@@ -341,7 +341,7 @@ float vec_dot_q3k_unpacked(int n, const q3k_unpacked *w, const block_q8_K *y) {
             __m512i u = _mm512_loadu_si512((const void *)(o->u + c * 64));
             __m512i xv = _mm512_loadu_si512((const void *)(y[b].qs + c * 64));
             __m512i p16 = _mm512_maddubs_epi16(u, xv);
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p16, _mm512_loadu_si512((const void *)(o->sx + c * 32))));
+            acc = _mm512_dpwssd_epi32(acc, p16, _mm512_loadu_si512((const void *)(o->sx + c * 32)));
         }
         __m256i cb = _mm256_madd_epi16(_mm256_loadu_si256((const __m256i *)o->sc),
                                        _mm256_loadu_si256((const __m256i *)y[b].bsums));
@@ -728,7 +728,7 @@ float vec_dot_q4_K_q8_K(int n, const block_q4_K *x, const block_q8_K *y) {
             const __m512i u = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_and_si256(q, m4)),
                                                  _mm256_and_si256(_mm256_srli_epi16(q, 4), m4), 1);
             const __m512i p16 = _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y[b].qs + 64 * j)));
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p16, _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_K4[j]), sc16)));
+            acc = _mm512_dpwssd_epi32(acc, p16, _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_K4[j]), sc16));
         }
         const float dy = y[b].d;
         accf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(fp16_to_fp32(x[b].d) * dy), accf);
@@ -762,7 +762,7 @@ float vec_dot_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y) {
                 _mm256_maskz_mov_epi8(_mm256_test_epi8_mask(hm, _mm256_set1_epi8((char)(1 << (2 * j + 1)))), c16));
             const __m512i u = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
             const __m512i p16 = _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y[b].qs + 64 * j)));
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p16, _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_K4[j]), sc16)));
+            acc = _mm512_dpwssd_epi32(acc, p16, _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_K4[j]), sc16));
         }
         const float dy = y[b].d;
         accf = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(fp16_to_fp32(x[b].d) * dy), accf);
@@ -802,8 +802,8 @@ void vec_dot2_q3_K_q8_K(int n, const block_q3_K *x, const block_q8_K *y0, const 
                 __m512i low = _mm512_and_si512(_mm512_srlv_epi16(qs, _mm512_load_si512((const void *)T_SHL_Q3[j])), m3);
                 __m512i u = _mm512_or_si512(low, _mm512_maskz_mov_epi8(_mm512_test_epi8_mask(hm, _mm512_load_si512((const void *)T_HBIT_Q3[h * 4 + j])), c4));
                 const __m512i sv = _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_Q3[p]), sc16);
-                a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(_mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y0[b].qs + c * 32))), sv));
-                a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(_mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y1[b].qs + c * 32))), sv));
+                a0 = _mm512_dpwssd_epi32(a0, _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y0[b].qs + c * 32))), sv);
+                a1 = _mm512_dpwssd_epi32(a1, _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y1[b].qs + c * 32))), sv);
             }
         }
         const __m256i cb0 = _mm256_madd_epi16(s16, _mm256_loadu_si256((const __m256i *)y0[b].bsums));
@@ -845,8 +845,8 @@ static inline void k45_dot2(int n, const void *xv, int hbits, const block_q8_K *
             }
             const __m512i u = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
             const __m512i sv = _mm512_permutexvar_epi16(_mm512_load_si512((const void *)T_SIDX_K4[j]), sc16);
-            a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(_mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y0[b].qs + 64 * j))), sv));
-            a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(_mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y1[b].qs + 64 * j))), sv));
+            a0 = _mm512_dpwssd_epi32(a0, _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y0[b].qs + 64 * j))), sv);
+            a1 = _mm512_dpwssd_epi32(a1, _mm512_maddubs_epi16(u, _mm512_loadu_si512((const void *)(y1[b].qs + 64 * j))), sv);
         }
         const float d = fp16_to_fp32(d16), dmin = fp16_to_fp32(dm16);
         f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a0), _mm512_set1_ps(d * y0[b].d), f0);
