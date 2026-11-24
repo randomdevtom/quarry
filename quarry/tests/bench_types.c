@@ -13,8 +13,10 @@
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
+static block_q8_K *g_xp;   // permuted activations for GT_Q4_KR
 static float dot1(int ty, const void *w, int n, const block_q8_K *x) {
     switch (ty) {
+    case GT_Q4_KR: return vec_dot_q4_KR_q8_KR(n, w, g_xp ? g_xp : x);
     case GT_Q3_K: return vec_dot_q3_K_q8_K(n, w, x);
     case GT_Q4_K: return vec_dot_q4_K_q8_K(n, w, x);
     case GT_Q5_K: return vec_dot_q5_K_q8_K(n, w, x);
@@ -43,6 +45,17 @@ static void bench(qg_file *g, const char *name, int64_t max_rows) {
     for (int i = 0; i < n; i++) x[i] = (i % 17) * 0.1f - 0.8f;
     block_q8_K *x0 = malloc(sizeof(block_q8_K) * (n / QK_K)), *x1 = malloc(sizeof(block_q8_K) * (n / QK_K));
     quantize_row_q8_K(x, x0, n);
+    int ty = t->type;
+    if (getenv("KR") && ty == GT_Q4_K) {
+        // reference dot before the repack, then repack and compare
+        float ref = vec_dot_q4_K_q8_K(n, (const block_q4_K *)w, x0);
+        q4k_repack_kr(w, rb * rows / sizeof(block_q4_K));
+        g_xp = malloc(sizeof(block_q8_K) * (n / QK_K));
+        q8k_permute_kr(x0, g_xp, n);
+        float kr = vec_dot_q4_KR_q8_KR(n, (const block_q4_K *)w, g_xp);
+        printf("%-26s Q4_KR row 0: %.6f vs Q4_K %.6f\n", name, kr, ref);
+        ty = GT_Q4_KR;
+    }
     for (int i = 0; i < n; i++) x[i] = -x[i] * 0.5f;
     quantize_row_q8_K(x, x1, n);
     {   // correctness: fast dot vs float reference over dequantized weights and inputs
@@ -71,14 +84,16 @@ static void bench(qg_file *g, const char *name, int64_t max_rows) {
             double t0 = now();
             #pragma omp parallel for schedule(static)
             for (int64_t r = 0; r < rows; r++) {
-                if (two) dot2(t->type, w + r * rb, n, x0, x1, &y[2 * r], &y[2 * r + 1]);
-                else y[r] = dot1(t->type, w + r * rb, n, x0);
+                if (two) dot2(ty, w + r * rb, n, x0, x1, &y[2 * r], &y[2 * r + 1]);
+                else y[r] = dot1(ty, w + r * rb, n, x0);
             }
             double dt = now() - t0;
             if (it && dt < best) best = dt;
         }
+        if (ty == GT_Q4_KR && two) break;
         printf("%-26s %-5s %s: %6.2f ms, %5.1f GB/s (threads %d)\n", name, qg_type_name(t->type), two ? "2 inputs" : "1 input ",
                best * 1e3, rb * rows / best / 1e9, omp_get_max_threads());
+        if (ty == GT_Q4_KR) printf("  (Q4_KR)\n");
     }
     free(w); free(x); free(y); free(x0); free(x1);
 }
@@ -86,6 +101,16 @@ static void bench(qg_file *g, const char *name, int64_t max_rows) {
 int main(int argc, char **argv) {
     qg_file g;
     if (argc < 2 || qg_open(&g, argv[1])) return 1;
+    if (argc > 2) {   // tensor names to bench, optionally name:max_rows
+        for (int i = 2; i < argc; i++) {
+            char nm[128]; snprintf(nm, sizeof nm, "%s", argv[i]);
+            char *c = strchr(nm, ':');
+            int64_t mr = 1 << 30;
+            if (c) { *c = 0; mr = atoll(c + 1); }
+            bench(&g, nm, mr);
+        }
+        return 0;
+    }
     bench(&g, "blk.0.attn_qkv.weight", 1 << 30);
     bench(&g, "blk.0.ssm_out.weight", 1 << 30);
     bench(&g, "blk.1.ffn_gate_exps.weight", 1 << 30);

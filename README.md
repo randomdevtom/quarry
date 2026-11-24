@@ -106,6 +106,35 @@ others with YaRN RoPE), 64 experts, 8 used.
 - the 4GB rows use a cgroup limit (`systemd-run --user --scope -p MemoryMax=4G`), with the model
   file evicted from the page cache first
 
+### LFM2.5-8B-A1B (Q4_K_M, 5.2GB, `lfm2moe`)
+
+Liquid's hybrid MoE: 18 gated short-convolution layers + 6 GQA attention layers, 2 dense
+layers then 32 experts (4 used, sigmoid routing). The whole model fits in RAM, so this is
+about compute, not the SSD.
+
+| | Quarry | llama.cpp |
+|---|---|---|
+| generation (light load) | **13.7-14.1 tok/s** | 12.4 tok/s (`llama-bench tg128`) |
+| generation, moderate background load (load average ~5) | **11.5 tok/s** | 6.6-8.9 tok/s |
+| generation, browser using ~2.5 of the 4 threads | **6.2 tok/s** | 3.2 tok/s |
+| prompt processing | **38 tok/s** (2199 tokens) | 35.7 tok/s (`pp512`) |
+
+Both engines were measured at the same time, with the same 4 threads and the same background load.
+
+- logits match llama.cpp (cosine 0.998, same top 3); the experts chosen match at every layer
+  except near-ties (score margin < 0.006). The batched path matches token by token.
+- thinking: the model opens `<think>` itself, and it is streamed as `reasoning_content`.
+  Tool calls use LFM's own format (`<|tool_call_start|>[get_weather(city="Lisbon")]<|tool_call_end|>`),
+  parsed into OpenAI `tool_calls`, and generation stops after one
+- Q4_K weights are reordered in place at load (`Q4_KR`, same 144-byte blocks) so that one
+  scale vector serves a whole block: +9% generation. `QUARRY_NO_KR=1` turns it off
+- prompts run through exact integer kernels (u8 weights x int8 activations with `dpbusd`,
+  scales in float per block). Requantizing rows to int8, as the Qwen path does, was too
+  lossy for these weights (cosine 0.975)
+- with a cache that holds every expert, all experts are read in the background at startup
+- generation is limited by RAM speed: ~1.0GB is read per token at ~15GB/s, and the RAM
+  delivers ~21GB/s
+
 ### Inkling 2 Mini (Q4_K_M, 18.7GB, `inkling2_loop`)
 
 | engine | generation tok/s |
@@ -218,6 +247,9 @@ laptop like this one. Later turns reuse the cached prefix and only process what'
 - `src/qwen35.c`: Qwen3.5/3.6 MoE forward pass (gated delta net with a 128x128 state per
   head, gated attention, shared expert). The recurrent state can't be rewound, so it is
   snapshotted at the end of each prompt for prefix reuse.
+- `src/lfm2.c`: LFM2 MoE forward pass (gated short convolutions, GQA attention with QK-norm,
+  sigmoid-routed MoE). One code path for decode and batched prompts. The conv state is
+  snapshotted per prompt for prefix reuse, as for Qwen3.5.
 - `src/inkling.c`: Inkling 2 forward pass (looped layers, block-residual mixing,
   relative-position attention with sinks, short convolutions, sigmoid-routed MoE).
 - `src/quants.c`: Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0 and Q8_0 kernels (AVX-512 VNNI),
@@ -232,10 +264,10 @@ and MBPP against a running server.
 
 ## Limits
 
-- architectures: qwen3moe, qwen35moe (Qwen3.5/3.6 MoE text), mellum, inkling2_loop
+- architectures: qwen3moe, qwen35moe (Qwen3.5/3.6 MoE text), mellum, inkling2_loop, lfm2moe
 - x86-64 with AVX-512 VNNI only (Ice Lake or newer, Zen 4 or newer)
-- one sequence at a time; batched prompt processing for Qwen3-Coder (Q3_K weights) and
-  Qwen3.5/3.6 (Q3_K-Q6_K); Inkling runs token by token
+- one sequence at a time; batched prompt processing for Qwen3-Coder (Q3_K weights),
+  Qwen3.5/3.6 (Q3_K-Q6_K) and LFM2 (Q4_K, Q6_K); Inkling runs token by token
 - the tokenizer comes from libllama (vocab-only load)
 
 ## License

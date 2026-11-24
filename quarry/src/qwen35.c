@@ -1814,12 +1814,20 @@ static inline void dot2x4_s8(int n, const q3k_s8 *w0, const q3k_s8 *w1, const ui
 static void mm_any(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
                    const float *X, int ldx, int T, float *Y, int ldy) {
     const int k = type == GT_Q3_K || type == GT_Q4_K || type == GT_Q5_K || type == GT_Q6_K ||
-                  type == GT_Q4_0 || type == GT_Q4_1 || type == GT_Q8_0;
+                  type == GT_Q4_0 || type == GT_Q4_1 || type == GT_Q8_0 || type == GT_Q4_KR;
     if (k && cols % QK_K == 0 && !getenv("QUARRY_PF_F32")) mm_q3k_s8(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
     else mm_f32(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
 }
 static void mm(const qmat *W, const float *X, int ldx, int T, float *Y, int ldy) {
     mm_any(W->type, W->data, W->row_bytes, W->rows, W->cols, X, ldx, T, Y, ldy);
+}
+void q35_mm_any(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
+                const float *X, int ldx, int T, float *Y, int ldy) {
+    mm_any(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
+}
+void q35_mm_f32(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
+                const float *X, int ldx, int T, float *Y, int ldy) {
+    mm_f32(type, base, rb, rows, cols, X, ldx, T, Y, ldy);
 }
 
 typedef struct {

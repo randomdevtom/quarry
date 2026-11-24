@@ -63,6 +63,9 @@ typedef struct {
     uint64_t *bytes_read, *loads;      // counters updated by the I/O threads
     int min_slots;
     const char *packed;                // optional file with each expert's parts back to back
+    // optional: called by the I/O thread on each part after it is read (e.g. an in-place repack)
+    void (*fixup)(void *ud, int layer, int part, uint8_t *data, uint64_t bytes);
+    void *fixup_ud;
 } expert_src;
 // write src's experts to `path`, each expert's parts back to back in its cache-slot layout,
 // so a miss is one contiguous read. Returns 0 on success.

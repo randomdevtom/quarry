@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- New architecture: LFM2 MoE (`lfm2moe`, e.g. LFM2.5-8B-A1B): 13.7-14.1 tok/s generation and
+  38 tok/s prompts on the test laptop (llama.cpp: 12.4 / 35.7), logits match llama.cpp.
+  Its chat template, thinking, and tool calls in LFM's pythonic format
+- Q4_K/Q5_K kernels: scales unpacked in registers (a store-forwarding stall on every block)
+- Q6_K kernel rewritten at 512 bits
+- `Q4_KR`: Q4_K reordered in place at load for a cheaper dot, and exact batched integer
+  matmuls for Q4_KR/Q6_K
+- expert cache: optional per-part hook after a read (used for the in-place repack)
+- non-streamed replies include `reasoning_content`
+- `tests/test_kquants.c`: K-quant kernels on random blocks (runs in `make test`, no model
+  needed); `tests/test_lfm.c`: logits against a llama.cpp reference
+
 ## v0.3.0 (2026-11-23)
 
 - Chat page: replies keep generating on the server when the phone sleeps or the tab is

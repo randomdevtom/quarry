@@ -109,3 +109,22 @@ float vec_dot_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y);
 void vec_dot2_q3_K_q8_K(int n, const block_q3_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);
 void vec_dot2_q4_K_q8_K(int n, const block_q4_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);
 void vec_dot2_q5_K_q8_K(int n, const block_q5_K *x, const block_q8_K *y0, const block_q8_K *y1, float *r0, float *r1);
+
+// ---- Q4_K, repacked in place for a cheaper dot (same 144-byte blocks) ----
+// The 128 quant bytes are reordered so that in each 64-byte half h, byte i holds (low nibble)
+// value s*32 + 16h + r and (high nibble) value s*32 + 16h + 8 + r, with s = i/8, r = i%8:
+// every int16 lane pair then belongs to sub-block lane/4 in all four 64-value chunks, so one
+// scale vector serves the whole block. Activations use the same order (q8k_permute_kr); their
+// bsums stay in natural order (only sub-block sums are needed).
+#define GT_Q4_KR 100
+void q4k_repack_kr(void *blocks, uint64_t n_blocks);
+void q8k_permute_kr(const block_q8_K *y, block_q8_K *yp, int n);
+float vec_dot_q4_KR_q8_KR(int n, const block_q4_K *x, const block_q8_K *yp);
+void dequant_row_q4_KR(const void *x, float *y, int64_t n);
+
+// exact batched matmul for Q4_KR (activations KR-permuted q8_K) and Q6_K (natural q8_K):
+// Y[t * ldy + r] = row r . token t. xs[t]: kq_xs of token t's activations.
+int kq_supported(int type);
+void kq_xs(const block_q8_K *x, int n, float *xs);
+void kq_matmul(int type, const uint8_t *base, uint64_t rb, int rows, int cols, int T,
+               const block_q8_K *const *x, const float *const *xs, float *Y, int ldy);

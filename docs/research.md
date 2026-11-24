@@ -104,3 +104,35 @@ attention projections ~29ms, output layer ~14ms, router ~5ms, rest ~10ms. RAM re
 is ~22GB/s, and ~1.4GB is read per token, so a perfect engine would reach ~15 tok/s; the
 fixed (non-expert) part alone is ~58ms. Using 6 of the 8 routed experts (`--experts 6`)
 cuts expert bytes and SSD reads by 25% and kept the same HumanEval subset score (19/21).
+
+## LFM2.5-8B-A1B (2026-11-24)
+
+Q4_K_M, 5.2GB, fits in RAM: a compute and RAM-speed problem, not an SSD one. Per token
+~1.0GB is read: experts ~0.58GB (gate/up Q4_K, down Q4_K or Q6_K), short-conv projections
+0.17GB, output layer (tied to the Q6_K embedding) 0.21GB, the rest ~0.08GB.
+
+Generation went 4.3 -> 14.1 tok/s (llama.cpp at the same time: 12.4):
+- Q4_K scale unpack stored 4 x u32 and reloaded them as one vector: the same store-forwarding
+  stall as Q3_K had. Done in registers: ~1.5x single-thread on Q4_K/Q5_K.
+- Q6_K rewritten at 512 bits (was 256-bit with a `mullo` per 32 values): ~1.3x.
+- One OpenMP region per stage for all ready experts (was two per expert).
+- `Q4_KR`: quants reordered inside each block so int16 lane k belongs to sub-block k/4 in
+  every 64-value chunk. One scale permute and one `madd` per block instead of four; bit-exact
+  per row. +9% generation.
+- Output layer from a 4-bit copy (candidates) + exact top-64 rows: 12.5 -> 10ms/token.
+- Under the browser load at the time (load average 6-9), dynamic OpenMP scheduling helped a
+  little; ACTIVE wait policy with 4 threads halved the speed (3.5 tok/s).
+
+Measured no gain: LTO, a 2-row decode kernel (shared activation loads, two chains), 3 vs 4
+threads. Serial work outside the matvecs is ~2ms/token, and the matvec regions stream at
+~14.5GB/s against ~21GB/s measured RAM bandwidth (16.6GB/s from one thread).
+
+Prompts went 14 -> 38 tok/s (llama.cpp pp512: 35.7):
+- the int8 requantized rows of the Qwen path (one scale per 256 values) were too lossy here:
+  logits cosine 0.975. Float rows are exact but compute-bound (~20 tok/s).
+- exact integer batched kernel: u8 weights as stored x int8 activations with `dpbusd`. In
+  Q4_KR every int32 lane of every chunk is in one sub-block, so all four chunks accumulate
+  in one register and the scale applies once per block. Q6_K applies scales per chunk.
+  2 rows x 4 tokens per tile, specialized at compile time (+11%). ~118 GMAC/s on Q4_KR,
+  ~70 on Q6_K, 4 threads. On Ice Lake client both 512-bit VNNI and FMA issue only on port 0,
+  which bounds it.

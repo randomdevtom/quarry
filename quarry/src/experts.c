@@ -35,6 +35,8 @@ struct expert_store {
     int fd, n_layer, n_expert, n_parts;
     uint64_t file_size, *src_off, *src_bytes;
     uint64_t *bytes_read, *loads;
+    void (*fixup)(void *ud, int layer, int part, uint8_t *data, uint64_t bytes);
+    void *fixup_ud;
     int fd_direct;
     int n_slots, n_keys;
     int n_stage;                // staging slots [n_slots, n_slots + n_stage): prefill reads, never cached
@@ -211,6 +213,8 @@ static void *io_worker(void *arg) {
             pthread_mutex_lock(&s->mu); tsum += now_s() - t_rd; bsum += total; pthread_mutex_unlock(&s->mu);
             if (nrd % 3000 == 0) fprintf(stderr, "[io: %llu reads, avg %.2f ms, %.2f GB/s per thread]\n", (unsigned long long)nrd, 1e3 * tsum / nrd, bsum / tsum / 1e9);
         }
+        if (s->fixup)
+            for (int k = 0; k < s->n_parts; k++) s->fixup(s->fixup_ud, key / s->n_expert, k, (uint8_t *)p[k], len[k]);
         pthread_mutex_lock(&s->mu);
         for (int k = 0; k < 3; k++) s->slots[i].p[k] = p[k];
         s->slots[i].state = S_READY;
@@ -335,6 +339,7 @@ struct expert_store *experts_open_src(const expert_src *src) {
     s->fd = src->fd; s->file_size = src->file_size;
     s->n_layer = src->n_layer; s->n_expert = src->n_expert; s->n_parts = src->n_parts;
     s->bytes_read = src->bytes_read; s->loads = src->loads;
+    s->fixup = src->fixup; s->fixup_ud = src->fixup_ud;
     const int np = s->n_layer * s->n_parts;
     s->src_off = malloc(np * sizeof(uint64_t)); s->src_bytes = malloc(np * sizeof(uint64_t));
     memcpy(s->src_off, src->off, np * sizeof(uint64_t));

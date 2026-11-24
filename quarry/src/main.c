@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "inkling.h"
+#include "lfm2.h"
 #include "model.h"
 #include "qwen35.h"
 #include "chat_html.h"   // generated from src/chat.html by the Makefile
@@ -62,6 +63,11 @@ typedef struct {
     qmodel m;
     ink_model im;
     q35_model qm;
+    int lfm;                           // 1: LFM2 MoE (short conv + attention)
+    lfm_model lm;
+    int t_think_open;                  // lfm: "<think>" token (-1 if none)
+    int t_tool_end;                    // lfm: "<|tool_call_end|>": the reply stops after a tool call
+    int trim_lead;                     // lfm: drop whitespace right after <think> / </think>
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
     float spec_rate;                   // running draft acceptance (MTP); drafting pauses when low
     int spec_idle;                     // tokens generated since drafting paused
@@ -104,19 +110,28 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     if (!e->tok_model) return -1;
     e->vocab = llama_model_get_vocab(e->tok_model);
     e->q35 = q35_detect(path);
-    e->ink = !e->q35 && ink_detect(path);
+    e->lfm = !e->q35 && lfm_detect(path);
+    e->ink = !e->q35 && !e->lfm && ink_detect(path);
     // Qwen MoE default: 6 of the 8 routed experts per token. Same HumanEval score in our tests
     // (Qwen3-Coder 19/21, Qwen3.8 distill 20/21), 10-25% faster. `--experts 8` restores the exact model.
     int is_mellum = 0;
     { qg_file g; if (!qg_open(&g, path)) { const char *a = qg_get_str(&g, "general.architecture"); is_mellum = a && !strcmp(a, "mellum"); qg_close(&g); } }
     // Qwen3.5/3.6/3.8 (and Mellum) run all 8: at 6 the Qwen3.8 distill fell into a "..." loop on a
     // short chat turn that the exact model answers normally. `--experts 6` is still available.
-    if (!e->ink && !is_mellum && !e->q35 && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
+    if (!e->ink && !is_mellum && !e->q35 && !e->lfm && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (e->q35) {
         if (q35_load(&e->qm, path, n_ctx)) return -1;
         e->snap = malloc(q35_state_bytes(&e->qm));
         int t[8];
         e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_im_start = llama_tokenize(e->vocab, "<|im_start|>", 12, t, 8, false, true) == 1 ? t[0] : -1;
+    } else if (e->lfm) {
+        if (lfm_load(&e->lm, path, n_ctx)) return -1;
+        e->snap = malloc(lfm_state_bytes(&e->lm));
+        int t[8];
+        e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_think_open = llama_tokenize(e->vocab, "<think>", 7, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_tool_end = llama_tokenize(e->vocab, "<|tool_call_end|>", 17, t, 8, false, true) == 1 ? t[0] : -1;
         e->t_im_start = llama_tokenize(e->vocab, "<|im_start|>", 12, t, 8, false, true) == 1 ? t[0] : -1;
     } else if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
     if (e->ink) {
@@ -138,7 +153,8 @@ static int tokenize(engine *e, const char *text, int *out, int cap) {
 }
 
 static int piece(engine *e, int tok, char *buf, int cap) {
-    int n = llama_token_to_piece(e->vocab, tok, buf, cap - 1, 0, false);
+    // LFM writes tool calls with special tokens (<|tool_call_start|> ...): keep them as text
+    int n = llama_token_to_piece(e->vocab, tok, buf, cap - 1, 0, e->lfm);
     if (n < 0) n = 0;
     buf[n] = 0;
     return n;
@@ -146,13 +162,14 @@ static int piece(engine *e, int tok, char *buf, int cap) {
 
 static int is_eog(engine *e, int tok) { return llama_vocab_is_eog(e->vocab, tok); }
 
-static int n_vocab(engine *e) { return e->q35 ? e->qm.c.n_vocab : e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
-static uint64_t bytes_read(engine *e) { return e->q35 ? e->qm.expert_bytes_read : e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
-static struct expert_store *eng_experts(engine *e) { return e->q35 ? e->qm.experts : e->ink ? e->im.experts : e->m.experts; }
+static int n_vocab(engine *e) { return e->lfm ? e->lm.c.n_vocab : e->q35 ? e->qm.c.n_vocab : e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
+static uint64_t bytes_read(engine *e) { return e->lfm ? e->lm.expert_bytes_read : e->q35 ? e->qm.expert_bytes_read : e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
+static struct expert_store *eng_experts(engine *e) { return e->lfm ? e->lm.experts : e->q35 ? e->qm.experts : e->ink ? e->im.experts : e->m.experts; }
 static float *fwd(engine *e, int tok, int pos) {
-    return e->q35 ? q35_forward(&e->qm, tok, pos) : e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos);
+    return e->lfm ? lfm_forward(&e->lm, tok, pos) : e->q35 ? q35_forward(&e->qm, tok, pos) : e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos);
 }
 static float *prefill(engine *e, const int *toks, int n, int pos0) {
+    if (e->lfm) return lfm_prefill(&e->lm, toks, n, pos0);
     if (e->q35) return q35_prefill(&e->qm, toks, n, pos0);
     if (!e->ink) return model_prefill(&e->m, toks, n, pos0);
     float *lg = NULL;
@@ -203,6 +220,21 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
     int common = 0;
     while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
     if (common == n) common = n - 1;   // need logits for the last token
+    if (e->lfm) {
+        // the conv state can't be rewound: continue from the current end, or from the snapshot
+        // taken before the last prompt's final <|im_start|>, or start over (attention KV is positional)
+        if (!(common == e->n_ctx_tokens && common > 0)) {
+            if (e->snap_pos > 0 && common >= e->snap_pos) { lfm_state_load(&e->lm, e->snap); common = e->snap_pos; }
+            else { lfm_state_reset(&e->lm); common = 0; }
+        }
+        const int cut = snap_cut(e, toks, common, n);
+        if (cut > common) prefill(e, toks + common, cut - common, common);
+        if (cut > common || e->snap_pos != cut) { lfm_state_save(&e->lm, e->snap); e->snap_pos = cut; }
+        float *lg = prefill(e, toks + cut, n - cut, cut);
+        for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
+        e->n_ctx_tokens = n;
+        return lg;
+    }
     if (e->q35) {
         // the delta-net state can't be rewound: continue from the current end, or from the
         // snapshot taken at the end of the last prompt, or start over
@@ -236,14 +268,22 @@ typedef int (*emit_fn)(const char *text, void *ud);
 // print one generated token (thinking/answer handling); nonzero to stop
 static int emit_tok(engine *e, int tok, int g, char *buf, int cap, emit_fn emit, void *ud) {
     int stop = 0;
-    if (e->q35 && tok == e->t_think_end && e->mode == 1) {
+    if (e->lfm && tok == e->t_think_open && tok >= 0) {
+        e->mode = 1;   // the model opened a thinking block
+        e->trim_lead = 1;
+        if (e->show_thinking && !e->reason_emit) stop = emit("\033[2m", ud);
+        return stop;
+    }
+    if ((e->q35 || e->lfm) && tok == e->t_think_end && e->mode == 1) {
         // end of the thinking block: what follows is the answer
         if (e->show_thinking) stop = emit("\033[0m\n", ud);
         e->mode = 2;
-    } else if (e->q35 && e->mode == 1) {
+        e->trim_lead = e->lfm;
+    } else if ((e->q35 || e->lfm) && e->mode == 1) {
         piece(e, tok, buf, cap);
+        if (e->trim_lead) { char *b = buf; while (*b == '\n' || *b == ' ') b++; if (!*b) return 0; memmove(buf, b, strlen(b) + 1); e->trim_lead = 0; }
         if (e->reason_emit) stop = e->reason_emit(buf, ud);
-        else if (e->show_thinking) stop = emit(g == 0 ? "\033[2m" : "", ud) || emit(buf, ud);
+        else if (e->show_thinking) stop = emit(g == 0 && !e->lfm ? "\033[2m" : "", ud) || emit(buf, ud);
     } else if (e->ink && (tok == e->t_think || tok == e->t_text || tok == e->t_end_msg || tok == e->t_msg_model)) {
         // Inkling structure tokens: switch between thinking and answer, print nothing
         const int was = e->mode;
@@ -252,8 +292,10 @@ static int emit_tok(engine *e, int tok, int g, char *buf, int cap, emit_fn emit,
         if (e->show_thinking && e->mode == 1) stop = emit("\033[2m", ud);
     } else {
         piece(e, tok, buf, cap);
+        if (e->trim_lead && e->mode == 2) { char *b = buf; while (*b == '\n' || *b == ' ') b++; if (!*b) return 0; memmove(buf, b, strlen(b) + 1); e->trim_lead = 0; }
         if (e->mode == 2) stop = emit(buf, ud);
         else if (e->mode == 1 && e->show_thinking) stop = emit(buf, ud);
+        if (e->lfm && tok == e->t_tool_end && e->t_tool_end >= 0) stop = 1;   // the client runs the tool next
     }
     return stop;
 }
@@ -419,6 +461,9 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     if (getenv("QUARRY_STATS")) {   // decode-only profile
         experts_reset_stats(eng_experts(e));
         memset(q35_prof, 0, sizeof q35_prof);
+        memset(lfm_prof, 0, sizeof lfm_prof);
+        { extern double lfm_total; lfm_total = 0; }
+        if (e->lfm) { e->lm.expert_bytes_read = 0; e->lm.pred_total = e->lm.pred_correct = 0; }
         if (e->q35) { e->qm.expert_bytes_read = 0; e->qm.draft_seconds = 0; e->qm.spec_steps = e->qm.spec_accepted = 0; e->qm.pred_total = e->qm.pred_correct = 0; }
     }
     st->t_prompt = now() - t0;
@@ -484,8 +529,8 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
 static char *chat_q35(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 static char *chat_mellum(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 
-// chat prompt from role/content pairs: ChatML for Qwen, Inkling's own format otherwise
 static engine *g_eng;
+// chat prompt from role/content pairs: ChatML for Qwen, Inkling's own format otherwise
 static char *chatml(const char **roles, const char **contents, int n) {
     size_t len = 256;
     for (int i = 0; i < n; i++) len += strlen(roles[i]) + strlen(contents[i]) + 96;
@@ -505,7 +550,20 @@ static char *chatml(const char **roles, const char **contents, int n) {
         if (!effort_done) sprintf(w, "<|message_system|><|content_text|>Thinking effort level: %g<|end_message|>", g_eng->effort);
         return p;
     }
-    for (int i = 0; i < n; i++) w += sprintf(w, "<|im_start|>%s\n%s<|im_end|>\n", roles[i], contents[i]);
+    int last_asst = -1;
+    if (g_eng && g_eng->lfm) {
+        w += sprintf(w, "<|startoftext|>");
+        for (int i = 0; i < n; i++) if (!strcmp(roles[i], "assistant")) last_asst = i;
+    }
+    for (int i = 0; i < n; i++) {
+        const char *ct = contents[i];
+        // LFM: earlier assistant turns drop their reasoning (as the model's chat template does)
+        if (g_eng && g_eng->lfm && !strcmp(roles[i], "assistant") && i != last_asst && strstr(ct, "</think>")) {
+            ct = strstr(ct, "</think>") + 8;
+            while (*ct == ' ' || *ct == '\n') ct++;
+        }
+        w += sprintf(w, "<|im_start|>%s\n%s<|im_end|>\n", roles[i], ct);
+    }
     sprintf(w, "<|im_start|>assistant\n");
     return p;
 }
@@ -570,6 +628,9 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
                                 100.0 * e->qm.pred_correct / (e->qm.pred_total + 1e-9), q35_prof[0], q35_prof[1], q35_prof[2], q35_prof[3], q35_prof[4], q35_prof[5], q35_prof[6], q35_prof[7]);
             if (e->q35 && e->qm.sp_full) fprintf(stderr, " | sparse attn: %.1f%% of rows, summarize %.2fs score %.2fs pick %.2fs",
                                 100.0 * e->qm.sp_rows / e->qm.sp_full, q35_sp[0], q35_sp[1], q35_sp[2]);
+            { extern double lfm_total; if (e->lfm) fprintf(stderr, " | forward %.2fs, matvec regions %.2fs", lfm_total, lfm_prof[7]); }
+            if (e->lfm) fprintf(stderr, " | prediction %.0f%% | conv %.1fs attn %.1fs (core %.1fs) dense %.1fs route %.1fs experts %.1fs output %.1fs",
+                                100.0 * e->lm.pred_correct / (e->lm.pred_total + 1e-9), lfm_prof[0], lfm_prof[1], lfm_prof[6], lfm_prof[2], lfm_prof[3], lfm_prof[4], lfm_prof[5]);
             if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);
             fprintf(stderr, "]\n");
         }
@@ -1055,9 +1116,218 @@ static void put_arg_value(sbuf *b, const char *val, const char *type) {
     free(t);
 }
 
+// LFM2 (the GGUF's template): BOS, tools listed as JSON in the system prompt ("List of tools:
+// [...]"), reasoning dropped from earlier assistant turns. Assistant tool calls in the history
+// are rendered the way the model writes them: <|tool_call_start|>[name(arg=value, ...)]<|tool_call_end|>
+static char *chat_lfm(const char **roles, const char **contents, const char **tcalls, int n, const char *tools) {
+    sbuf b = {0};
+    sb_put(&b, "<|startoftext|>");
+    int i0 = 0;
+    const int has_tools = tools && *skip_ws(tools) == '[' && *skip_ws(skip_ws(tools) + 1) != ']';
+    if ((n > 0 && !strcmp(roles[0], "system")) || has_tools) {
+        sb_put(&b, "<|im_start|>system\n");
+        if (n > 0 && !strcmp(roles[0], "system")) { sb_put(&b, contents[0]); i0 = 1; if (has_tools) sb_put(&b, "\n"); }
+        if (has_tools) {
+            sb_put(&b, "List of tools: [");
+            const char *nx, *t = json_arr_next(tools, &nx);
+            for (int k = 0; t; t = json_arr_next(nx, &nx), k++) {
+                char *raw = json_raw(t);
+                if (k) sb_put(&b, ", ");
+                sb_put(&b, raw);
+                free(raw);
+            }
+            sb_put(&b, "]");
+        }
+        sb_put(&b, "<|im_end|>\n");
+    }
+    int last_asst = -1;
+    for (int i = i0; i < n; i++) if (!strcmp(roles[i], "assistant")) last_asst = i;
+    for (int i = i0; i < n; i++) {
+        sb_put(&b, "<|im_start|>"); sb_put(&b, roles[i]); sb_put(&b, "\n");
+        const char *c = contents[i];
+        if (!strcmp(roles[i], "assistant") && i != last_asst && strstr(c, "</think>")) {
+            c = strstr(c, "</think>") + 8;
+            while (*c == ' ' || *c == '\n') c++;
+        }
+        sb_put(&b, c);
+        if (!strcmp(roles[i], "assistant") && tcalls[i] && *skip_ws(tcalls[i]) == '[') {
+            sb_put(&b, "<|tool_call_start|>[");
+            const char *nx, *tc = json_arr_next(tcalls[i], &nx);
+            for (int k = 0; tc; tc = json_arr_next(nx, &nx), k++) {
+                const char *f = json_get(tc, "function");
+                if (!f) f = tc;
+                const char *v;
+                char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+                if (k) sb_put(&b, ", ");
+                sb_put(&b, name); sb_put(&b, "(");
+                if ((v = json_get(f, "arguments"))) {
+                    char *args = *skip_ws(v) == '"' ? json_str(skip_ws(v), NULL) : json_raw(v);
+                    char *kk; const char *av, *it = skip_ws(args);
+                    int na = 0;
+                    if (*it == '{')
+                        while ((it = json_obj_next(it, &kk, &av))) {
+                            char *val = json_raw(av);
+                            if (na++) sb_put(&b, ", ");
+                            sb_put(&b, kk); sb_put(&b, "="); sb_put(&b, val);
+                            free(val); free(kk);
+                        }
+                    free(args);
+                }
+                sb_put(&b, ")");
+                free(name);
+            }
+            sb_put(&b, "]<|tool_call_end|>");
+        }
+        sb_put(&b, "<|im_end|>\n");
+    }
+    sb_put(&b, "<|im_start|>assistant\n");
+    return b.p;
+}
+
+// ---- LFM tool calls: <|tool_call_start|>[f(a=1, b="x"), g()]<|tool_call_end|> ----
+// A Python literal at p, written to o as JSON; returns the end, or NULL if it is not one.
+static const char *py_value(const char *p, sbuf *o, int depth) {
+    while (*p == ' ' || *p == '\n' || *p == '\t') p++;
+    if (depth > 32) return NULL;
+    if (*p == '"' || *p == '\'') {
+        const char q = *p++;
+        sb_put(o, "\"");
+        for (; *p && *p != q; p++) {
+            char c = *p;
+            if (c == '\\' && p[1]) {
+                const char e = *++p;
+                if (e == 'n') sb_put(o, "\\n"); else if (e == 't') sb_put(o, "\\t"); else if (e == 'r') sb_put(o, "\\r");
+                else if (e == 'u' || e == '/') { sb_putn(o, "\\", 1); sb_putn(o, &e, 1); }
+                else if (e == '"' || e == '\\') { sb_putn(o, "\\", 1); sb_putn(o, &e, 1); }
+                else sb_putn(o, &e, 1);   // \' and others: the character itself
+                continue;
+            }
+            if (c == '"') sb_put(o, "\\\"");
+            else if (c == '\n') sb_put(o, "\\n");
+            else if (c == '\t') sb_put(o, "\\t");
+            else if ((unsigned char)c < 0x20) { char u[8]; snprintf(u, sizeof u, "\\u%04x", c); sb_put(o, u); }
+            else sb_putn(o, &c, 1);
+        }
+        if (*p != q) return NULL;
+        sb_put(o, "\"");
+        return p + 1;
+    }
+    if (*p == '[' || *p == '(') {
+        const char close = *p == '[' ? ']' : ')';
+        p++;
+        sb_put(o, "[");
+        for (int k = 0;; k++) {
+            while (*p == ' ' || *p == '\n') p++;
+            if (*p == close) { sb_put(o, "]"); return p + 1; }
+            if (k) { if (*p != ',') return NULL; p++; while (*p == ' ' || *p == '\n') p++; if (*p == close) { sb_put(o, "]"); return p + 1; } sb_put(o, ","); }
+            if (!(p = py_value(p, o, depth + 1))) return NULL;
+        }
+    }
+    if (*p == '{') {
+        p++;
+        sb_put(o, "{");
+        for (int k = 0;; k++) {
+            while (*p == ' ' || *p == '\n') p++;
+            if (*p == '}') { sb_put(o, "}"); return p + 1; }
+            if (k) { if (*p != ',') return NULL; p++; while (*p == ' ' || *p == '\n') p++; if (*p == '}') { sb_put(o, "}"); return p + 1; } sb_put(o, ","); }
+            if (!(p = py_value(p, o, depth + 1))) return NULL;
+            while (*p == ' ') p++;
+            if (*p++ != ':') return NULL;
+            sb_put(o, ":");
+            if (!(p = py_value(p, o, depth + 1))) return NULL;
+        }
+    }
+    if (!strncmp(p, "True", 4)) { sb_put(o, "true"); return p + 4; }
+    if (!strncmp(p, "False", 5)) { sb_put(o, "false"); return p + 5; }
+    if (!strncmp(p, "None", 4)) { sb_put(o, "null"); return p + 4; }
+    if (!strncmp(p, "true", 4) || !strncmp(p, "null", 4)) { sb_putn(o, p, 4); return p + 4; }
+    if (!strncmp(p, "false", 5)) { sb_put(o, "false"); return p + 5; }
+    const char *q = p;
+    while (*q && (isdigit((unsigned char)*q) || strchr("+-.eE", *q))) q++;
+    if (q > p) { sb_putn(o, p, q - p); return q; }
+    return NULL;
+}
+
+static void put_call(sbuf *out, int k, long id, const char *name, const char *args) {
+    size_t cap = strlen(args) * 2 + 16;
+    char *aesc = malloc(cap), nesc[512], head[1024];
+    json_escape(args, aesc, cap);
+    json_escape(name, nesc, sizeof nesc);
+    snprintf(head, sizeof head, "%s{\"index\":%d,\"id\":\"call_%ld_%d\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"",
+             k ? "," : "", k, id, k, nesc);
+    sb_put(out, head); sb_put(out, aesc); sb_put(out, "\"}}");
+    free(aesc);
+}
+
+static char *parse_tool_calls_lfm(const char *text, long id, size_t *content_len) {
+    static const char T0[] = "<|tool_call_start|>", T1[] = "<|tool_call_end|>";
+    const char *first = strstr(text, T0);
+    *content_len = first ? (size_t)(first - text) : strlen(text);
+    if (!first) return NULL;
+    sbuf out = {0};
+    sb_put(&out, "[");
+    int k = 0;
+    for (const char *p = first; (p = strstr(p, T0));) {
+        p += sizeof T0 - 1;
+        while (*p == ' ' || *p == '\n') p++;
+        const int list = *p == '[';
+        if (list) p++;
+        for (;;) {
+            while (*p == ' ' || *p == '\n' || *p == ',') p++;
+            if (*p == ']' || !*p || !strncmp(p, T1, sizeof T1 - 1)) break;
+            if (*p == '{') {   // JSON form: {"name": ..., "arguments": {...}}
+                const char *v;
+                char *name = (v = json_get(p, "name")) ? json_str(skip_ws(v), NULL) : NULL;
+                if (!name) break;
+                const char *av = json_get(p, "arguments");
+                char *args = !av ? strdup("{}") : *skip_ws(av) == '"' ? json_str(skip_ws(av), NULL) : json_raw(av);
+                put_call(&out, k++, id, name, args);
+                free(args); free(name);
+                sbuf skip = {0};
+                const char *e = py_value(p, &skip, 0);
+                free(skip.p);
+                if (!e) break;
+                p = e;
+                continue;
+            }
+            const char *ns = p;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '.' || *p == '-')) p++;
+            if (p == ns || *p != '(') break;
+            char *name = strndup(ns, p - ns);
+            p++;
+            sbuf args = {0};
+            sb_put(&args, "{");
+            int ok = 1;
+            for (int na = 0;; na++) {
+                while (*p == ' ' || *p == '\n' || (na && *p == ',')) p++;
+                if (*p == ')') { p++; break; }
+                const char *ks = p;
+                while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+                if (p == ks || *p != '=') { ok = 0; break; }
+                char kb[256];
+                snprintf(kb, sizeof kb, "%s\"%.*s\":", na ? "," : "", (int)(p - ks), ks);
+                sb_put(&args, kb);
+                if (!(p = py_value(p + 1, &args, 0))) { ok = 0; break; }
+            }
+            sb_put(&args, "}");
+            if (ok) put_call(&out, k++, id, name, args.p);
+            free(args.p); free(name);
+            if (!ok) break;
+            if (!list) break;
+        }
+        const char *e = strstr(p, T1);
+        if (!e) break;
+        p = e + sizeof T1 - 1;
+    }
+    sb_put(&out, "]");
+    if (k == 0) { free(out.p); *content_len = strlen(text); return NULL; }
+    return out.p;
+}
+
 // split generated text into content (before the first <tool_call>) and an OpenAI tool_calls
 // JSON array (NULL when there are no calls)
 static char *parse_tool_calls(const char *text, const char *tools, long id, size_t *content_len) {
+    if (g_eng && g_eng->lfm) return parse_tool_calls_lfm(text, id, content_len);
     const char *first = strstr(text, "<tool_call>");
     *content_len = first ? (size_t)(first - text) : strlen(text);
     if (!first) return NULL;
@@ -1287,12 +1557,12 @@ static int emit_http(const char *t, void *ud) {
     if (!r->stream || r->in_call) return 0;
     if (!r->tools) { size_t n = r->acc_len - r->sent; r->sent = r->acc_len; return send_delta(r, r->acc + r->acc_len - n, n); }
     // tools on: never stream the <tool_call> markup; hold back a possible start of it
-    const char *tc = strstr(r->acc + r->sent, "<tool_call>");
+    const char *tag = g_eng && g_eng->lfm ? "<|tool_call_start|>" : "<tool_call>";
+    const char *tc = strstr(r->acc + r->sent, tag);
     size_t upto = tc ? (size_t)(tc - r->acc) : r->acc_len;
     if (tc) r->in_call = 1;
     else {
-        static const char tag[] = "<tool_call>";
-        for (size_t k = sizeof tag - 2; k > 0; k--)
+        for (size_t k = strlen(tag) - 1; k > 0; k--)
             if (r->acc_len - r->sent >= k && !strncmp(r->acc + r->acc_len - k, tag, k)) { upto = r->acc_len - k; break; }
     }
     if (upto <= r->sent) return 0;
@@ -1386,7 +1656,7 @@ static void handle(engine *e, int fd) {
             "{\"model\":\"%s\",\"arch\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,\"cache_gb\":%.1f,"
             "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
             "\"vision\":%s,\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
-            e->model_name, e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
+            e->model_name, e->lfm ? "lfm2moe" : e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
             getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
             h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
             e->mctx ? "true" : "false", e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
@@ -1432,7 +1702,8 @@ static void handle(engine *e, int fd) {
         if (ck && (v = json_get(ck, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
         if ((v = json_get(body, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
         e->think = think;
-        char *prompt = e->ink ? chatml(roles, contents, nm)
+        char *prompt = e->lfm ? chat_lfm(roles, contents, tcalls, nm, tools)
+                     : e->ink ? chatml(roles, contents, nm)
                      : e->q35 && e->qm.c.mellum ? chat_mellum(roles, contents, tcalls, nm, tools, think)
                      : e->q35 ? chat_q35(roles, contents, tcalls, nm, tools, think)
                      : chat_qwen(roles, contents, tcalls, nm, tools);
@@ -1495,20 +1766,27 @@ static void handle(engine *e, int fd) {
             send_all(fd, end, n);
         } else {
             char *ctext = strndup(rc.acc, content_len);
-            size_t ecap = content_len * 6 + 64;
-            char *esc = malloc(ecap), *resp = malloc(ecap + (calls ? strlen(calls) : 0) + 1024);
+            size_t ecap = content_len * 6 + 64, rcap = rc.racc_len * 6 + 64;
+            char *esc = malloc(ecap), *resc = malloc(rcap), *resp = malloc(ecap + rcap + (calls ? strlen(calls) : 0) + 1024);
             json_escape(ctext, esc, ecap);
+            resc[0] = 0;
+            if (rc.racc_len) {   // the thinking, as reasoning_content (as in streamed replies)
+                char *re = malloc(rcap);
+                json_escape(rc.racc, re, rcap);
+                snprintf(resc, rcap, ",\"reasoning_content\":\"%s\"", re);
+                free(re);
+            }
             int bl = sprintf(resp,
                              "{\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion\",\"model\":\"quarry\","
-                             "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"%s%s},"
+                             "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"%s%s%s},"
                              "\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                              "\"total_tokens\":%d}}",
-                             rc.id, esc, calls ? ",\"tool_calls\":" : "", calls ? calls : "", finish,
+                             rc.id, esc, resc, calls ? ",\"tool_calls\":" : "", calls ? calls : "", finish,
                              st.prompt_tokens, st.gen_tokens, st.prompt_tokens + st.gen_tokens);
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
             send_all(fd, hdr, n);
             send_all(fd, resp, bl);
-            free(esc); free(resp); free(ctext);
+            free(esc); free(resc); free(resp); free(ctext);
         }
         free(calls);
         free(prompt);
@@ -1687,6 +1965,7 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         printf("%s: %d tokens in %.1fs = %.1f tok/s | SSD %.2f GB | attn mm %.1fs, attn %.1fs, route %.1fs, experts %.1fs (io wait %.1fs, gate+up %.1fs, down %.1fs)\n",
                run ? "warm" : "cold", n, dt, n / dt, (bytes_read(e) - b0) / 1e9,
                qt_pf[0], qt_pf[1], qt_pf[2], qt_pf[3], qt_pf[4], qt_pf[5], qt_pf[6]);
+        if (e->lfm) { printf("  lfm2: conv %.1fs, attention %.1fs (core %.1fs), dense %.1fs, route %.1fs, experts %.1fs, output %.1fs\n", lfm_prof[0], lfm_prof[1], lfm_prof[6], lfm_prof[2], lfm_prof[3], lfm_prof[4], lfm_prof[5]); memset(lfm_prof, 0, sizeof lfm_prof); }
         if (e->q35) printf("  q35: delta-net %.1fs (proj %.1fs, conv+norm %.1fs, recur %.1fs), attention %.1fs (core %.1fs), moe %.1fs\n", q35_prof[0], q35_prof[6], q35_prof[7], q35_prof[4], q35_prof[1], q35_mp[7], q35_prof[3]);
         if (e->q35) printf("  moe: shared %.1fs, route %.1fs, cached experts %.1fs, streamed %.1fs, stream wait %.1fs | repack (thread 0) q3k %.1fs, other %.1fs\n", q35_mp[0], q35_mp[1], q35_mp[2], q35_mp[3], q35_mp[4], q35_mp[5], q35_mp[6]);
     }
@@ -1731,7 +2010,8 @@ static int cmd_debug_tools(int argc, char **argv) {
     if (!strcmp(argv[1], "parse-tools")) {
         char *out = read_file(argv[3]);
         size_t cl;
-        char *calls = parse_tool_calls(out, tools, 1, &cl);
+        // QUARRY_TOOLS_LFM=1: the LFM format (<|tool_call_start|>[f(a=1)]<|tool_call_end|>)
+        char *calls = getenv("QUARRY_TOOLS_LFM") ? parse_tool_calls_lfm(out, 1, &cl) : parse_tool_calls(out, tools, 1, &cl);
         printf("content: [%.*s]\ntool_calls: %s\n", (int)cl, out, calls ? calls : "(none)");
         return 0;
     }

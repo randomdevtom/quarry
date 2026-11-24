@@ -114,3 +114,9 @@ void q35_kv_from(q35_model *m, int pos);
 void q35_sparse_set(int budget, int recent, int min_ctx, int reselect);   // sparse attention settings (tests)
 void q35_kv_summarize_all(q35_model *m, int rows);   // after writing cache rows directly   // rows from pos on will be rewritten
 extern double q35_prof[8], q35_mp[8], q35_sp[3];
+// batched matmul (prefill): Y[t * ldy + r] = W_r . X[t * ldx] for rows [0, rows), tokens [0, T)
+void q35_mm_any(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
+                const float *X, int ldx, int T, float *Y, int ldy);
+// the same with rows dequantized to float (exact weights)
+void q35_mm_f32(int type, const uint8_t *base, uint64_t rb, int rows, int cols,
+                const float *X, int ldx, int T, float *Y, int ldy);

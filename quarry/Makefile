@@ -12,7 +12,7 @@ LLAMA_LIBS = $(LLAMA_FLAGS) -lllama -lggml -lggml-base
 ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libmtmd.so),)
 LLAMA_LIBS += -I$(LLAMA_DIR)/tools/mtmd -lmtmd -DQUARRY_VISION
 endif
-CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c
+CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c src/lfm2.c
 
 all: build/quarry build/quarry-bench build/quarry-info
 
@@ -37,6 +37,9 @@ test: build/quarry
 	$(CC) $(CFLAGS) $(CORE) tests/test_inkling.c -o build/test_inkling $(LDLIBS)
 	$(CC) $(CFLAGS) src/qgguf.c src/quants.c tests/test_quants2.c -o build/test_quants2 $(LDLIBS)
 	$(CC) $(CFLAGS) $(CORE) tests/test_q35.c -o build/test_q35 $(LDLIBS)
+	$(CC) $(CFLAGS) $(CORE) tests/test_lfm.c -o build/test_lfm $(LDLIBS)
+	$(CC) $(CFLAGS) src/qgguf.c src/quants.c tests/test_kquants.c -o build/test_kquants $(LDLIBS)
+	./build/test_kquants
 
 ref: tests/ref_dump.c tests/ref_logits.c
 	$(CC) -O2 -Wno-deprecated-declarations tests/ref_dump.c -o build/ref_dump $(LLAMA_LIBS)
