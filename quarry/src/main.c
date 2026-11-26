@@ -583,6 +583,61 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
     return lg;
 }
 
+// Type-ahead (Qwen3.5/3.6): read the conversation and the user's message as typed so far, while
+// they are still typing. text is the rendered prompt cut inside the last user message, ustart the
+// offset where that message's content starts. The state at the start of the message becomes the
+// snapshot, so if the user then changes what they typed, only their message is read again; if
+// they only add to it, the real request continues from the end. Returns the tokens now cached.
+static int eng_prefill_partial(engine *e, const char *text, size_t ustart) {
+    int *toks = malloc(sizeof(int) * e->n_ctx), *ut = malloc(sizeof(int) * e->n_ctx);
+    const int n = tokenize_reuse(e, text, toks, e->n_ctx);
+    char *pre = strndup(text, ustart);
+    int nu = tokenize(e, pre, ut, e->n_ctx);
+    free(pre);
+    if (nu <= 0 || nu > n || memcmp(ut, toks, sizeof(int) * nu)) nu = -1;   // no clean token boundary
+    free(ut);
+    if (n < 8 || n >= e->n_ctx - 8) { free(toks); return e->n_ctx_tokens; }
+    int common = 0;
+    while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
+    if (common == n) { free(toks); return n; }   // already read
+    if (!(common == e->n_ctx_tokens && common > 0)) {
+        const int mem = e->snap_pos > 0 && common >= e->snap_pos ? e->snap_pos : e->snap2_pos > 0 && common >= e->snap2_pos ? e->snap2_pos : 0;
+        int disk;
+        if ((disk = pc_load(e, toks, n, mem)) > 0) common = disk;
+        else if (mem && mem == e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; e->qm.rope_delta = e->snap_delta; }
+        else if (mem) { q35_state_load(&e->qm, e->snap2); common = e->snap2_pos; e->qm.rope_delta = e->snap2_delta; }
+        else { q35_state_reset(&e->qm); common = 0; e->qm.rope_delta = 0; }
+    }
+    if (common < e->snap2_pos) e->snap2_pos = 0;
+    const int from = common;
+    quarry_pf_done = from;
+#define PARTIAL_ABORTED() do { if (quarry_abort) { for (int i = from; i < quarry_pf_done; i++) e->ctx_tokens[i] = toks[i]; \
+        e->n_ctx_tokens = quarry_pf_done; free(toks); return quarry_pf_done; } } while (0)
+    const int se = sys_end(e, toks, n);
+    if (se > common && se < n) {
+        prefill(e, toks + common, se - common, common);
+        PARTIAL_ABORTED();
+        q35_state_save(&e->qm, e->snap2); e->snap2_pos = se; e->snap2_delta = e->qm.rope_delta;
+        pc_save(e, toks, se);
+        common = se;
+    }
+    if (nu > common) {
+        prefill(e, toks + common, nu - common, common);
+        PARTIAL_ABORTED();
+        common = nu;
+    }
+    if (nu >= 0 && nu == common) { q35_state_save(&e->qm, e->snap); e->snap_pos = nu; e->snap_delta = e->qm.rope_delta; }
+    if (n > common) {
+        prefill(e, toks + common, n - common, common);
+        PARTIAL_ABORTED();
+    }
+#undef PARTIAL_ABORTED
+    for (int i = from; i < n; i++) e->ctx_tokens[i] = toks[i];
+    e->n_ctx_tokens = n;
+    free(toks);
+    return n;
+}
+
 // generation callback: return nonzero to stop
 typedef int (*emit_fn)(const char *text, void *ud);
 
@@ -2264,6 +2319,36 @@ static void handle(engine *e, int fd) {
         if (stream) {
             int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n%s\r\n", cors);
             send_all(fd, hdr, n);
+        }
+        if (e->q35 && (v = json_get(body, "quarry_prefill")) && !strncmp(skip_ws(v), "true", 4)) {
+            // type-ahead: read the prompt up to the last user message as typed so far, minus its
+            // last word (still changing); nothing is generated
+            int done = -1;
+            const char *um = NULL;
+            for (const char *q = prompt; (q = strstr(q, "<|im_start|>user\n")); q++) um = q;
+            if (um && nm > 0 && !strcmp(roles[nm - 1], "user")) {
+                const size_t us = (size_t)(um - prompt) + strlen("<|im_start|>user\n");
+                const char *ce = strstr(prompt + us, "<|im_end|>");
+                size_t ul = ce ? (size_t)(ce - (prompt + us)) : 0;
+                while (ul > 0 && !isspace((unsigned char)prompt[us + ul - 1])) ul--;   // drop the word being typed
+                while (ul > 0 && isspace((unsigned char)prompt[us + ul - 1])) ul--;
+                char *txt = strndup(prompt, us + ul);
+                g_poll_req = &rc; quarry_poll = prefill_poll; quarry_abort = 0;
+                double t0 = now();
+                done = eng_prefill_partial(e, txt, us);
+                g_poll_req = NULL; quarry_abort = 0;
+                fprintf(stderr, "[type-ahead: %d tokens cached (%.1fs)%s]\n", done, now() - t0, rc.cancelled ? ", stopped" : "");
+                free(txt);
+            }
+            char out[128];
+            const int bl = snprintf(out, sizeof out, "{\"prefilled\":%d}", done);
+            const int hn = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
+            if (!stream) { send_all(fd, hdr, hn); send_all(fd, out, bl); }
+            else send_all(fd, "data: [DONE]\n\n", 14);
+            free(rc.acc); free(prompt);
+            for (int i = 0; i < nm; i++) { free((void *)roles[i]); free((void *)contents[i]); }
+            free(buf);
+            return;
         }
         gen_stats st = {0};
         e->reason_emit = emit_reason_http;
