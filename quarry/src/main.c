@@ -1394,7 +1394,8 @@ static char *chat_q35(const char **roles, const char **contents, const char **tc
             sbuf ct = {0}; put_trimmed(&ct, c);
             sb_put(&b, "<|im_start|>assistant\n");
             if (rs) { sb_put(&b, "<think>\n"); sb_putn(&b, rs, rl); if (rl && rs[rl - 1] != '\n') sb_put(&b, "\n"); sb_put(&b, "</think>\n\n"); }
-            else if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
+            else sb_put(&b, "<think>\n\n</think>\n\n");   // every reply as generated (the official template drops it
+                                                               // before the last question, which forced re-reading each reply)
             if (ct.n) sb_put(&b, ct.p);
             if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
                 const char *nx, *tc = json_arr_next(tcalls[i], &nx);
@@ -1475,7 +1476,8 @@ static char *chat_mellum(const char **roles, const char **contents, const char *
             }
             sb_put(&b, "<|im_start|>assistant\n");
             if (rs) { sb_put(&b, "<think>\n"); sb_putn(&b, rs, rl); if (rl && rs[rl - 1] != '\n') sb_put(&b, "\n"); sb_put(&b, "</think>\n\n"); }
-            else if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
+            else sb_put(&b, "<think>\n\n</think>\n\n");   // every reply as generated (the official template drops it
+                                                               // before the last question, which forced re-reading each reply)
             sb_put(&b, c);
             if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
                 const char *nx, *tc = json_arr_next(tcalls[i], &nx);
