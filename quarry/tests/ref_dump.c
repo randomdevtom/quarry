@@ -8,7 +8,7 @@
 #include <string.h>
 
 static const char *g_prefix;
-static const char *keep[] = {"inp_embd", "norm-", "attn_norm-", "kq_soft_max-", "kqv_out-", "l_out-", "attn_out-", "ffn_inp-", "ffn_out-", "result_norm", "Qcur-", "Kcur-", "Vcur-", "Rcur-", "kq_b-", NULL};
+static const char *keep[] = {"inp_embd", "norm-", "attn_norm-", "kq_soft_max-", "kqv_out-", "l_out-", "attn_out-", "ffn_inp-", "ffn_out-", "result_norm", "Qcur-", "Kcur-", "Vcur-", "Rcur-", "kq_b-", "ffn_norm-", "attn_gated-", "attn_o_proj-", "ffn_moe_out-", "ffn_shexp-", "attn_gate_softplus-", "Qcur_rope-", "Kcur_rope-", "Qcur_normed-", NULL};
 
 static int wanted(const char *name) {
     for (int i = 0; keep[i]; i++) if (!strncmp(name, keep[i], strlen(keep[i]))) return 1;

@@ -84,6 +84,15 @@ static const qg_tensor *find(qg_file *g, const char *name, int required) {
 }
 static float *f32(qg_file *g, const char *name) {
     const qg_tensor *t = find(g, name, 1);
+    if (t->type == GT_BF16) {   // some quants (unsloth UD) store the routers as BF16
+        const size_t n = t->nbytes / 2;
+        uint16_t *h = xalloc(t->nbytes);
+        read_at(g, h, t->nbytes, t->offset);
+        float *p = xalloc(n * 4);
+        for (size_t i = 0; i < n; i++) { uint32_t u = (uint32_t)h[i] << 16; memcpy(p + i, &u, 4); }
+        free(h);
+        return p;
+    }
     if (t->type != GT_F32) { fprintf(stderr, "qwen35: %s is not F32\n", name); exit(1); }
     float *p = xalloc(t->nbytes);
     read_at(g, p, t->nbytes, t->offset);
@@ -443,6 +452,7 @@ static void qin_init(qin *q, const float *x, int n, block_q8_K *kbuf, int8_t *qs
     q->qk = kbuf; q->a = (act32){qs, d, s};
 }
 static void qin_need(qin *q, int type) {
+    if (type == GT_F32 || type == GT_F16) return;   // these use the float input directly
     if (type == GT_Q8_0 || type == GT_Q5_0 || type == GT_Q4_0 || type == GT_Q4_1) {
         if (!q->have_32) { quantize_row_a32(q->x, q->a, q->n); q->have_32 = 1; }
     } else if (!q->have_k) { quantize_row_q8_K(q->x, q->qk, q->n); q->have_k = 1; }
@@ -457,6 +467,24 @@ static inline float row_dot(int type, const uint8_t *row, int n, const qin *q) {
     case GT_Q4_K: return vec_dot_q4_K_q8_K(n, (const block_q4_K *)row, q->qk);
     case GT_Q5_K: return vec_dot_q5_K_q8_K(n, (const block_q5_K *)row, q->qk);
     case GT_Q6_K: return vec_dot_q6_K_q8_K(n, (const block_q6_K *)row, q->qk);
+    case GT_F32: {   // small matrices some quants keep unquantized (e.g. bartowski's ssm_alpha/ssm_beta)
+        const float *w = (const float *)row;
+        __m512 acc = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) acc = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(q->x + i), acc);
+        float s = _mm512_reduce_add_ps(acc);
+        for (; i < n; i++) s += w[i] * q->x[i];
+        return s;
+    }
+    case GT_F16: {
+        const uint16_t *w = (const uint16_t *)row;
+        __m512 acc = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) acc = _mm512_fmadd_ps(f16x16(w + i), _mm512_loadu_ps(q->x + i), acc);
+        float s = _mm512_reduce_add_ps(acc);
+        for (; i < n; i++) s += _cvtsh_ss(w[i]) * q->x[i];
+        return s;
+    }
     }
     fprintf(stderr, "qwen35: no dot for type %d\n", type);
     exit(1);
@@ -2246,7 +2274,8 @@ static void pf_moe(q35_model *m, int l, q35_pfbuf *b, int T) {
     m->expert_loads += nm;
 }
 
-static void pf_chunk(q35_model *m, const int *tokens, const float *emb, int T, int pos0) {
+// returns 1 when the request was cancelled part way (the chunk's state is then incomplete)
+static int pf_chunk(q35_model *m, const int *tokens, const float *emb, int T, int pos0) {
     const q35_cfg *c = &m->c;
     q35_pfbuf *b = pf_get(m);
     const int D = c->n_embd;
@@ -2254,6 +2283,8 @@ static void pf_chunk(q35_model *m, const int *tokens, const float *emb, int T, i
     else for (int t = 0; t < T; t++) embed(m, tokens[t], b->X + (size_t)t * D);
     for (int l = 0; l < c->n_layer; l++) {
         const q35_layer *L = &m->layers[l];
+        if (quarry_poll) quarry_poll();
+        if (quarry_abort && tokens) return 1;
         #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; t++) rmsnorm(b->XN + (size_t)t * D, b->X + (size_t)t * D, L->attn_norm, D, c->eps);
         double t0 = qnow();
@@ -2267,6 +2298,7 @@ static void pf_chunk(q35_model *m, const int *tokens, const float *emb, int T, i
         q35_prof[3] += qnow() - t0;
         for (size_t i = 0; i < (size_t)T * D; i++) b->X[i] += b->R[i];
     }
+    return 0;
 }
 
 float *q35_prefill(q35_model *m, const int *tokens, int n, int pos0) {
@@ -2274,16 +2306,29 @@ float *q35_prefill(q35_model *m, const int *tokens, int n, int pos0) {
     if (n < 8 || getenv("QUARRY_PER_TOKEN")) {
         float *lg = NULL;
         for (int i = 0; i < n; i++) lg = q35_forward(m, tokens[i], pos0 + i);
+        quarry_pf_done = pos0 + n;
         return lg;
     }
     // all but the last token in chunks; the last one through the normal path for its logits
     int done = 0;
+    // a cancel can stop a chunk between layers: the recurrent state is copied before each chunk
+    // and put back, so the cache stays valid up to the chunk start (attention rows past it are
+    // simply overwritten later)
+    static void *pf_snap;
+    if (quarry_poll && !pf_snap) pf_snap = malloc(q35_state_bytes(m));
     while (done < n - 1) {
+        if (quarry_abort) { quarry_pf_done = pos0 + done; return NULL; }   // cancelled: state is valid up to here
         int T = n - 1 - done;
         if (T > Q35_PF_T) T = Q35_PF_T;
-        pf_chunk(m, tokens + done, NULL, T, pos0 + done);
+        if (pf_snap) q35_state_save(m, pf_snap);
+        if (pf_chunk(m, tokens + done, NULL, T, pos0 + done)) {
+            q35_state_load(m, pf_snap);
+            quarry_pf_done = pos0 + done;
+            return NULL;
+        }
         done += T;
     }
+    quarry_pf_done = pos0 + n;
     return q35_forward(m, tokens[n - 1], pos0 + n - 1);
 }
 

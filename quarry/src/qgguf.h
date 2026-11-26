@@ -8,6 +8,7 @@
 enum qg_type_id {
     GT_F32 = 0, GT_F16 = 1, GT_Q4_0 = 2, GT_Q4_1 = 3, GT_Q5_0 = 6, GT_Q8_0 = 8,
     GT_Q2_K = 10, GT_Q3_K = 11, GT_Q4_K = 12, GT_Q5_K = 13, GT_Q6_K = 14,
+    GT_BF16 = 30,
 };
 
 enum qg_vtype {

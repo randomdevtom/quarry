@@ -52,6 +52,13 @@ int model_load(qmodel *m, const char *path, int n_ctx);
 float *model_forward(qmodel *m, int token, int pos);
 // run n tokens at positions pos0.. as batches; returns logits of the last one
 float *model_prefill(qmodel *m, const int *tokens, int n, int pos0);
+// called between layers during prompt processing, so a server can answer (or queue) the
+// connections that arrive during a long prompt; NULL when unused
+extern void (*quarry_poll)(void);
+// set when the request was cancelled during prompt processing: q35_prefill stops at the next chunk
+// boundary, returns NULL and leaves the number of tokens now in the cache in quarry_pf_done
+extern volatile int quarry_abort;
+extern int quarry_pf_done;
 extern double qt_pf[8];        // prefill profile: 0 attn mm, 1 attn core, 2 route, 3 experts, 4 io wait, 5 misc
 
 // expert source API (implemented in experts.c)

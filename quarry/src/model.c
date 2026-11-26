@@ -444,6 +444,9 @@ float *model_forward(qmodel *m, int token, int pos) {
 #define PF_T 512
 #define PF_TT 8        // tokens per attention work item
 #define NH_MAX 8       // query heads per kv head handled per item (gqa)
+void (*quarry_poll)(void);
+volatile int quarry_abort;
+int quarry_pf_done;
 double qt_pf[8];
 
 typedef struct {

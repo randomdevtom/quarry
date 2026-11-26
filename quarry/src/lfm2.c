@@ -797,6 +797,7 @@ static void forward_batch(lfm_model *m, const int *tokens, int T, int pos0, int 
     for (int t = 0; t < T; t++) dequant_row(E->type, E->data + (uint64_t)tokens[t] * E->row_bytes, s->x + (size_t)t * D, D);
     for (int l = 0; l < c->n_layer; l++) {
         const lfm_layer *L = &m->layers[l];
+        if (T > 1 && quarry_poll) quarry_poll();
         for (int t = 0; t < T; t++) rmsnorm(s->xn + (size_t)t * D, s->x + (size_t)t * D, L->attn_norm, D, c->eps);
         double t0 = lnow();
         if (L->is_attn) { attention(m, L, m->attn_idx[l], s, T, pos0, s->o); lfm_prof[1] += lnow() - t0; }

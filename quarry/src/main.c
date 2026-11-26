@@ -14,6 +14,9 @@
 #include <poll.h>
 #include <ctype.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <utime.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -22,6 +25,7 @@
 
 #include "inkling.h"
 #include "lfm2.h"
+#include "laguna.h"
 #include "model.h"
 #include "qwen35.h"
 #include "chat_html.h"   // generated from src/chat.html by the Makefile
@@ -65,10 +69,15 @@ typedef struct {
     q35_model qm;
     int lfm;                           // 1: LFM2 MoE (short conv + attention)
     lfm_model lm;
+    int lag;                           // 1: Laguna (full + sliding-window attention MoE)
+    lag_model gm;
+    char *sys_prefix;                  // lag: the rendered system block (its end is a snapshot point)
     int t_think_open;                  // lfm: "<think>" token (-1 if none)
     int t_tool_end;                    // lfm: "<|tool_call_end|>": the reply stops after a tool call
     int trim_lead;                     // lfm: drop whitespace right after <think> / </think>
     void *snap; int snap_pos;          // q35: recurrent state saved at the end of the last prompt
+    void *snap2; int snap2_pos;        // q35/lfm: state at the end of the first message (the system
+    int snap2_delta;                   // prompt), so a client that changes its history still reuses it
     float spec_rate;                   // running draft acceptance (MTP); drafting pauses when low
     int spec_idle;                     // tokens generated since drafting paused
     void *mctx;                        // mtmd vision context (Qwen3.5/3.6 + mmproj), NULL if none
@@ -94,6 +103,8 @@ typedef struct {
     const struct llama_vocab *vocab;
     int *ctx_tokens, n_ctx_tokens;     // tokens whose KV is in the cache
     int n_ctx;
+    uint64_t model_id;
+    int saved_pos;                     // conversation prefix last saved to disk                 // q35 prefix cache: which model a saved prefix belongs to
     unsigned long long rng;
 } engine;
 
@@ -110,29 +121,48 @@ static int eng_load(engine *e, const char *path, int n_ctx) {
     if (!e->tok_model) return -1;
     e->vocab = llama_model_get_vocab(e->tok_model);
     e->q35 = q35_detect(path);
+    {   // model identity for the on-disk prefix cache: file name and size
+        struct stat sb; uint64_t h = 1469598103934665603ull;
+        for (const char *q = path; *q; q++) h = (h ^ (unsigned char)*q) * 1099511628211ull;
+        if (!stat(path, &sb)) h ^= (uint64_t)sb.st_size * 0x9E3779B97F4A7C15ull;
+        e->model_id = h;
+    }
     e->lfm = !e->q35 && lfm_detect(path);
-    e->ink = !e->q35 && !e->lfm && ink_detect(path);
+    e->lag = !e->q35 && !e->lfm && lag_detect(path);
+    e->ink = !e->q35 && !e->lfm && !e->lag && ink_detect(path);
     // Qwen MoE default: 6 of the 8 routed experts per token. Same HumanEval score in our tests
     // (Qwen3-Coder 19/21, Qwen3.8 distill 20/21), 10-25% faster. `--experts 8` restores the exact model.
     int is_mellum = 0;
     { qg_file g; if (!qg_open(&g, path)) { const char *a = qg_get_str(&g, "general.architecture"); is_mellum = a && !strcmp(a, "mellum"); qg_close(&g); } }
     // Qwen3.5/3.6/3.8 (and Mellum) run all 8: at 6 the Qwen3.8 distill fell into a "..." loop on a
     // short chat turn that the exact model answers normally. `--experts 6` is still available.
-    if (!e->ink && !is_mellum && !e->q35 && !e->lfm && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
+    if (!e->ink && !is_mellum && !e->q35 && !e->lfm && !e->lag && !getenv("QUARRY_TOPK")) setenv("QUARRY_TOPK", "6", 1);
     if (e->q35) {
         if (q35_load(&e->qm, path, n_ctx)) return -1;
         e->snap = malloc(q35_state_bytes(&e->qm));
+        e->snap2 = malloc(q35_state_bytes(&e->qm));
         int t[8];
         e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
         e->t_im_start = llama_tokenize(e->vocab, "<|im_start|>", 12, t, 8, false, true) == 1 ? t[0] : -1;
     } else if (e->lfm) {
         if (lfm_load(&e->lm, path, n_ctx)) return -1;
         e->snap = malloc(lfm_state_bytes(&e->lm));
+        e->snap2 = malloc(lfm_state_bytes(&e->lm));
         int t[8];
         e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
         e->t_think_open = llama_tokenize(e->vocab, "<think>", 7, t, 8, false, true) == 1 ? t[0] : -1;
         e->t_tool_end = llama_tokenize(e->vocab, "<|tool_call_end|>", 17, t, 8, false, true) == 1 ? t[0] : -1;
         e->t_im_start = llama_tokenize(e->vocab, "<|im_start|>", 12, t, 8, false, true) == 1 ? t[0] : -1;
+    } else if (e->lag) {
+        if (lag_load(&e->gm, path, n_ctx)) return -1;
+        e->snap = malloc(lag_state_bytes(&e->gm));
+        e->snap2 = malloc(lag_state_bytes(&e->gm));
+        int t[8];
+        e->t_think_end = llama_tokenize(e->vocab, "</think>", 8, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_think_open = llama_tokenize(e->vocab, "<think>", 7, t, 8, false, true) == 1 ? t[0] : -1;
+        e->t_tool_end = -1;   // several calls can follow; </assistant> ends the reply
+        // the snapshot goes before the last "<assistant>" (the generation prompt)
+        e->t_im_start = llama_tokenize(e->vocab, "<assistant>", 11, t, 8, false, true) == 1 ? t[0] : -1;
     } else if (e->ink ? ink_load(&e->im, path, n_ctx) : model_load(&e->m, path, n_ctx)) return -1;
     if (e->ink) {
         int t[8];
@@ -154,7 +184,7 @@ static int tokenize(engine *e, const char *text, int *out, int cap) {
 
 static int piece(engine *e, int tok, char *buf, int cap) {
     // LFM writes tool calls with special tokens (<|tool_call_start|> ...): keep them as text
-    int n = llama_token_to_piece(e->vocab, tok, buf, cap - 1, 0, e->lfm);
+    int n = llama_token_to_piece(e->vocab, tok, buf, cap - 1, 0, e->lfm || e->lag);
     if (n < 0) n = 0;
     buf[n] = 0;
     return n;
@@ -162,13 +192,72 @@ static int piece(engine *e, int tok, char *buf, int cap) {
 
 static int is_eog(engine *e, int tok) { return llama_vocab_is_eog(e->vocab, tok); }
 
-static int n_vocab(engine *e) { return e->lfm ? e->lm.c.n_vocab : e->q35 ? e->qm.c.n_vocab : e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
-static uint64_t bytes_read(engine *e) { return e->lfm ? e->lm.expert_bytes_read : e->q35 ? e->qm.expert_bytes_read : e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
-static struct expert_store *eng_experts(engine *e) { return e->lfm ? e->lm.experts : e->q35 ? e->qm.experts : e->ink ? e->im.experts : e->m.experts; }
+// Tokenize a prompt, reusing the cached tokens when the prompt text starts with their text.
+// A reply the model generated comes back as history in the next request, and re-tokenizing its
+// text often gives different tokens than the ones generated (BPE can split a string several
+// ways). Then the prompt no longer matches the cache, and the whole reply (thousands of tokens
+// after a big file write) is read again. Keeping the cached tokens avoids that.
+static int tokenize_reuse(engine *e, const char *prompt, int *out, int cap) {
+    const int nc = e->n_ctx_tokens;
+    if (nc > 0 && nc < cap && !getenv("QUARRY_NO_REUSE")) {
+        const size_t plen = strlen(prompt);
+        size_t off = 0;
+        char buf[256];
+        int i = 0;
+        // Whitespace may differ: the client's history renders a tool call from its parsed
+        // arguments ("<parameter=path>\nfile\n") while the model may have written it without
+        // the newlines. Spaces and newlines are skipped on either side; anything else must match.
+        for (; i < nc; i++) {
+            if (e->ctx_tokens[i] < 0) break;
+            const int k = llama_token_to_piece(e->vocab, e->ctx_tokens[i], buf, sizeof buf, 0, true);
+            if (k < 0) break;
+            size_t o = off;
+            int j = 0, ok = 1;
+            while (j < k) {
+                const char c = buf[j];
+                if (o < plen && prompt[o] == c) { o++; j++; continue; }
+                if (c == '\n' || c == ' ') { j++; continue; }                          // only in the cache
+                if (o < plen && (prompt[o] == '\n' || prompt[o] == ' ')) { o++; continue; }   // only in the prompt
+                ok = 0; break;
+            }
+            if (!ok) break;
+            off = o;
+        }
+        if (getenv("QUARRY_PREFIX_DEBUG"))
+            fprintf(stderr, "[reuse: %d of %d cached tokens match the prompt text (%zu of %zu bytes)]\n", i, nc, off, plen);
+        // QUARRY_REUSE_DUMP=file: where the prompt text and the cached tokens part (for debugging)
+        const char *dump = getenv("QUARRY_REUSE_DUMP");
+        if (dump && *dump && i < nc) {
+            FILE *df = fopen(dump, "a");
+            if (df) {
+                fprintf(df, "=== mismatch at token %d of %d, byte %zu\n--- prompt:\n", i, nc, off);
+                const size_t from = off > 300 ? off - 300 : 0;
+                fwrite(prompt + from, 1, (off + 300 < plen ? off + 300 : plen) - from, df);
+                fprintf(df, "\n--- cached (from the mismatch):\n");
+                for (int k = i; k < nc && k < i + 60; k++) {
+                    const int pl = llama_token_to_piece(e->vocab, e->ctx_tokens[k], buf, sizeof buf, 0, true);
+                    if (pl > 0) fwrite(buf, 1, pl, df);
+                }
+                fprintf(df, "\n");
+                fclose(df);
+            }
+        }
+        if (i == nc && off < plen) {
+            const int m = tokenize(e, prompt + off, out + nc, cap - nc);
+            if (m > 0) { memcpy(out, e->ctx_tokens, sizeof(int) * nc); return nc + m; }
+        }
+    }
+    return tokenize(e, prompt, out, cap);
+}
+
+static int n_vocab(engine *e) { return e->lag ? e->gm.c.n_vocab : e->lfm ? e->lm.c.n_vocab : e->q35 ? e->qm.c.n_vocab : e->ink ? e->im.c.n_vocab : e->m.c.n_vocab; }
+static uint64_t bytes_read(engine *e) { return e->lag ? e->gm.expert_bytes_read : e->lfm ? e->lm.expert_bytes_read : e->q35 ? e->qm.expert_bytes_read : e->ink ? e->im.expert_bytes_read : e->m.expert_bytes_read; }
+static struct expert_store *eng_experts(engine *e) { return e->lag ? e->gm.experts : e->lfm ? e->lm.experts : e->q35 ? e->qm.experts : e->ink ? e->im.experts : e->m.experts; }
 static float *fwd(engine *e, int tok, int pos) {
-    return e->lfm ? lfm_forward(&e->lm, tok, pos) : e->q35 ? q35_forward(&e->qm, tok, pos) : e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos);
+    return e->lag ? lag_forward(&e->gm, tok, pos) : e->lfm ? lfm_forward(&e->lm, tok, pos) : e->q35 ? q35_forward(&e->qm, tok, pos) : e->ink ? ink_forward(&e->im, tok, pos) : model_forward(&e->m, tok, pos);
 }
 static float *prefill(engine *e, const int *toks, int n, int pos0) {
+    if (e->lag) return lag_prefill(&e->gm, toks, n, pos0);
     if (e->lfm) return lfm_prefill(&e->lm, toks, n, pos0);
     if (e->q35) return q35_prefill(&e->qm, toks, n, pos0);
     if (!e->ink) return model_prefill(&e->m, toks, n, pos0);
@@ -215,23 +304,231 @@ static int snap_cut(engine *e, const int *toks, int from, int n) {
     return from > n - 1 ? from : n - 1;
 }
 
+// end of the first message (the second <|im_start|>), when the prompt starts with a system
+// message and has more after it; -1 otherwise
+static int sys_end(engine *e, const int *toks, int n) {
+    if (e->lag) {   // the tokens of the rendered system block, if the prompt starts with them
+        if (!e->sys_prefix) return -1;
+        static int *st, cap;
+        if (!st) { cap = e->n_ctx; st = malloc(sizeof(int) * cap); }
+        const int ns = tokenize(e, e->sys_prefix, st, cap);
+        if (ns <= 0) return -1;
+        // the block's last tokens can merge with what follows ("</system>\n<user>"): snapshot at
+        // the end of the matching part when that is all but a few tokens of the block
+        int m = 0;
+        while (m < ns && m < n - 1 && st[m] == toks[m]) m++;
+        return m >= ns - 4 && m > 8 ? m : -1;
+    }
+    int k = 0;
+    while (k < n && toks[k] != e->t_im_start) k++;   // the first one (after a BOS, if any)
+    for (int i = k + 1; i < n - 1; i++) if (toks[i] == e->t_im_start) return i;
+    return -1;
+}
+
+// lfm / lag: a state that can't be rewound (LFM's conv state, Laguna's sliding-window rings)
+static void st_save(engine *e, void *d) { if (e->lag) lag_state_save(&e->gm, d); else lfm_state_save(&e->lm, d); }
+static void st_load(engine *e, const void *s) { if (e->lag) lag_state_load(&e->gm, s); else lfm_state_load(&e->lm, s); }
+static void st_reset(engine *e) { if (e->lag) lag_state_reset(&e->gm); else lfm_state_reset(&e->lm); }
+
+// ---------------- q35 prompt-prefix cache on disk ----------------
+// The system prompt (with its tool list) is the same for every chat of a client, but the KV cache
+// and the single in-RAM snapshot only hold the last prompt, so another client or another chat in
+// between meant reading it all again (600-7000 tokens, 25 s to minutes). Each system-prompt
+// prefix is saved here: recurrent state + the attention KV of its rows. A new prompt that starts
+// with a saved prefix loads it (~0.1 s) and only reads its own messages.
+typedef struct { uint32_t magic, ver; uint64_t model; int32_t n_tok, rope_delta, n_attn, kvd; uint64_t state_bytes; } pc_hdr;
+enum { PC_MAGIC = 0x51504331, PC_VER = 1, PC_KEEP = 24 };
+// total size of the saved prefixes (QUARRY_PREFIX_MB, default 3000)
+static long long pc_budget(void) { const char *v = getenv("QUARRY_PREFIX_MB"); return (v ? atoll(v) : 3000) << 20; }
+static int pc_tokens(const char *fp, int *buf, int cap, pc_hdr *h);
+
+static const char *pc_dir(void) {
+    static char d[1024];
+    if (d[0]) return d;
+    const char *env = getenv("QUARRY_PREFIX_DIR");
+    if (env && !*env) return NULL;   // empty: off
+    if (env) snprintf(d, sizeof d, "%s", env);
+    else {
+        const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+        if (xdg && *xdg) snprintf(d, sizeof d, "%s/quarry/prefix", xdg);
+        else if (home) snprintf(d, sizeof d, "%s/.cache/quarry/prefix", home);
+        else return NULL;
+    }
+    char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", d);
+    for (char *q = tmp + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(tmp, 0755); *q = '/'; }
+    mkdir(tmp, 0755);
+    return d;
+}
+static uint64_t pc_hash(uint64_t model, const int *t, int n) {
+    uint64_t h = model ^ 0xcbf29ce484222325ull;
+    for (int i = 0; i < n; i++) h = (h ^ (uint32_t)t[i]) * 1099511628211ull;
+    return h;
+}
+static int pc_kvd(engine *e) { return e->qm.c.n_head_kv * e->qm.c.hd; }
+
+static void pc_save_state(engine *e, const int *toks, int n, const void *state) {
+    const char *dir = pc_dir();
+    if (!dir || n < 64 || e->qm.rope_delta != 0) return;
+    char path[1200], tmp[1300];
+    snprintf(path, sizeof path, "%s/%016llx.qpc", dir, (unsigned long long)pc_hash(e->model_id, toks, n));
+    if (access(path, F_OK) == 0) { utime(path, NULL); return; }
+    snprintf(tmp, sizeof tmp, "%s.tmp%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    q35_model *m = &e->qm;
+    const int kvd = pc_kvd(e);
+    pc_hdr h = { PC_MAGIC, PC_VER, e->model_id, n, m->rope_delta, m->n_attn, kvd, q35_state_bytes(m) };
+    int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(toks, sizeof(int), n, f) == (size_t)n
+          && fwrite(state, 1, h.state_bytes, f) == h.state_bytes;
+    for (int a = 0; ok && a < m->n_attn; a++) {
+        const size_t off = (size_t)a * m->c.n_ctx * kvd;
+        ok = fwrite(m->kc + off, 2, (size_t)n * kvd, f) == (size_t)n * kvd
+          && fwrite(m->vc + off, 2, (size_t)n * kvd, f) == (size_t)n * kvd;
+    }
+    if (fclose(f) || !ok || rename(tmp, path)) { unlink(tmp); return; }
+    // drop older saves of this same conversation (a prefix of it, longer than a system prompt:
+    // those stay, they start new chats), then keep the newest files within the size budget
+    DIR *dd = opendir(dir);
+    if (!dd) return;
+    static char names[256][300]; time_t mt[256]; long long sz[256]; int nn = 0;
+    static int *tb; static int tb_cap;
+    if (tb_cap < n) { tb_cap = n; tb = realloc(tb, sizeof(int) * tb_cap); }
+    struct dirent *de;
+    while ((de = readdir(dd)) && nn < 256) {
+        size_t L = strlen(de->d_name);
+        if (L < 5 || strcmp(de->d_name + L - 4, ".qpc")) continue;
+        char fp[1600]; struct stat sb;
+        snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+        if (stat(fp, &sb) || !strcmp(fp, path)) { if (!strcmp(fp, path)) { snprintf(names[nn], sizeof names[nn], "%s", de->d_name); mt[nn] = sb.st_mtime; sz[nn++] = sb.st_size; } continue; }
+        pc_hdr oh;
+        const int on = pc_tokens(fp, tb, n, &oh);
+        if (on >= 1024 && on < n && !memcmp(tb, toks, sizeof(int) * on)) { unlink(fp); continue; }
+        snprintf(names[nn], sizeof names[nn], "%s", de->d_name); mt[nn] = sb.st_mtime; sz[nn++] = sb.st_size;
+    }
+    closedir(dd);
+    long long total = 0;
+    for (int i = 0; i < nn; i++) total += sz[i];
+    while (nn > 1 && (nn > PC_KEEP || total > pc_budget())) {
+        int o = 0;
+        for (int i = 1; i < nn; i++) if (mt[i] < mt[o]) o = i;
+        char fp[1600]; snprintf(fp, sizeof fp, "%s/%s", dir, names[o]);
+        if (!strcmp(fp, path)) break;
+        unlink(fp); total -= sz[o];
+        memcpy(names[o], names[nn - 1], sizeof names[o]); mt[o] = mt[nn - 1]; sz[o] = sz[nn - 1]; nn--;
+    }
+    fprintf(stderr, "[prefix cache: saved %d tokens]\n", n);
+}
+
+static void pc_save(engine *e, const int *toks, int n) { pc_save_state(e, toks, n, e->snap2); }
+
+static int pc_tokens(const char *fp, int *buf, int cap, pc_hdr *h) {
+    FILE *f = fopen(fp, "rb");
+    if (!f) return 0;
+    int n = 0;
+    if (fread(h, sizeof *h, 1, f) == 1 && h->magic == PC_MAGIC && h->ver == PC_VER && h->n_tok > 0 && h->n_tok <= cap
+        && fread(buf, sizeof(int), h->n_tok, f) == (size_t)h->n_tok) n = h->n_tok;
+    fclose(f);
+    return n;
+}
+
+// longest saved prefix of toks[0..n-1) on disk: its length (0: none), path in best
+static int pc_find(engine *e, const int *toks, int n, char *best, size_t best_sz);
+
+// load the longest saved prefix of toks[0..n-1) into the model state, KV and snap2; returns its length or 0
+static int pc_load(engine *e, const int *toks, int n, int at_least) {
+    char best[1600];
+    const int best_n = pc_find(e, toks, n, best, sizeof best);
+    if (best_n <= at_least) return 0;
+    q35_model *m = &e->qm;
+    const int kvd = pc_kvd(e);
+    FILE *f = fopen(best, "rb");
+    if (!f) return 0;
+    pc_hdr h;
+    int ok = fread(&h, sizeof h, 1, f) == 1 && fseek(f, (long)sizeof(int) * h.n_tok, SEEK_CUR) == 0
+          && fread(e->snap2, 1, h.state_bytes, f) == h.state_bytes;
+    for (int a = 0; ok && a < m->n_attn; a++) {
+        const size_t off = (size_t)a * m->c.n_ctx * kvd;
+        ok = fread(m->kc + off, 2, (size_t)h.n_tok * kvd, f) == (size_t)h.n_tok * kvd
+          && fread(m->vc + off, 2, (size_t)h.n_tok * kvd, f) == (size_t)h.n_tok * kvd;
+    }
+    fclose(f);
+    if (!ok) { unlink(best); return 0; }
+    utime(best, NULL);
+    q35_state_load(m, e->snap2);
+    m->rope_delta = h.rope_delta;
+    q35_kv_from(m, 0);   // block summaries were for the old rows
+    e->snap2_pos = h.n_tok; e->snap2_delta = h.rope_delta;
+    e->snap_pos = 0;
+    for (int i = 0; i < h.n_tok; i++) e->ctx_tokens[i] = toks[i];
+    e->n_ctx_tokens = h.n_tok;
+    fprintf(stderr, "[prefix cache: loaded %d tokens]\n", h.n_tok);
+    return h.n_tok;
+}
+
+static int pc_find(engine *e, const int *toks, int n, char *best, size_t best_sz) {
+    const char *dir = pc_dir();
+    best[0] = 0;
+    if (!dir) return 0;
+    DIR *dd = opendir(dir);
+    if (!dd) return 0;
+    q35_model *m = &e->qm;
+    const int kvd = pc_kvd(e);
+    int best_n = 0;
+    static int *tb; static int tb_cap;
+    struct dirent *de;
+    while ((de = readdir(dd))) {
+        size_t L = strlen(de->d_name);
+        if (L < 5 || strcmp(de->d_name + L - 4, ".qpc")) continue;
+        char fp[1600]; snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+        FILE *f = fopen(fp, "rb");
+        if (!f) continue;
+        pc_hdr h;
+        if (fread(&h, sizeof h, 1, f) == 1 && h.magic == PC_MAGIC && h.ver == PC_VER && h.model == e->model_id
+            && h.n_attn == m->n_attn && h.kvd == kvd && h.state_bytes == q35_state_bytes(m)
+            && h.n_tok > best_n && h.n_tok < n && h.n_tok <= e->n_ctx) {
+            if (tb_cap < h.n_tok) { tb_cap = h.n_tok; tb = realloc(tb, sizeof(int) * tb_cap); }
+            if (fread(tb, sizeof(int), h.n_tok, f) == (size_t)h.n_tok && !memcmp(tb, toks, sizeof(int) * h.n_tok)) {
+                best_n = h.n_tok; snprintf(best, best_sz, "%s", fp);
+            }
+        }
+        fclose(f);
+    }
+    closedir(dd);
+    return best_n;
+}
+
 // feed prompt tokens, reusing the KV of the longest common prefix
 static float *eng_prefill(engine *e, const int *toks, int n) {
     int common = 0;
     while (common < n && common < e->n_ctx_tokens && e->ctx_tokens[common] == toks[common]) common++;
     if (common == n) common = n - 1;   // need logits for the last token
-    if (e->lfm) {
+    if (getenv("QUARRY_PREFIX_DEBUG"))
+        fprintf(stderr, "[prefix: %d of %d tokens match the cache (%d cached), snapshots at %d and %d, first message ends at %d]\n",
+                common, n, e->n_ctx_tokens, e->snap_pos, e->snap2_pos, sys_end(e, toks, n));
+    if (getenv("QUARRY_PREFIX_DEBUG") && e->n_ctx_tokens > 3 && n > 3)
+        fprintf(stderr, "[prefix: new %d %d %d %d, cached %d %d %d %d]\n", toks[0], toks[1], toks[2], toks[3],
+                e->ctx_tokens[0], e->ctx_tokens[1], e->ctx_tokens[2], e->ctx_tokens[3]);
+    if (e->lfm || e->lag) {
         // the conv state can't be rewound: continue from the current end, or from the snapshot
         // taken before the last prompt's final <|im_start|>, or start over (attention KV is positional)
         if (!(common == e->n_ctx_tokens && common > 0)) {
-            if (e->snap_pos > 0 && common >= e->snap_pos) { lfm_state_load(&e->lm, e->snap); common = e->snap_pos; }
-            else { lfm_state_reset(&e->lm); common = 0; }
+            if (e->snap_pos > 0 && common >= e->snap_pos) { st_load(e, e->snap); common = e->snap_pos; }
+            else if (e->snap2_pos > 0 && common >= e->snap2_pos) { st_load(e, e->snap2); common = e->snap2_pos; }
+            else { st_reset(e); common = 0; }
+        }
+        if (common < e->snap2_pos) e->snap2_pos = 0;
+        const int se = sys_end(e, toks, n);
+        const int from = common;   // tokens from here on are new in the cache
+        if (se > common) {
+            prefill(e, toks + common, se - common, common);
+            st_save(e, e->snap2); e->snap2_pos = se;
+            common = se;
         }
         const int cut = snap_cut(e, toks, common, n);
         if (cut > common) prefill(e, toks + common, cut - common, common);
-        if (cut > common || e->snap_pos != cut) { lfm_state_save(&e->lm, e->snap); e->snap_pos = cut; }
+        if (cut > common || e->snap_pos != cut) { st_save(e, e->snap); e->snap_pos = cut; }
         float *lg = prefill(e, toks + cut, n - cut, cut);
-        for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
+        for (int i = from; i < n; i++) e->ctx_tokens[i] = toks[i];
         e->n_ctx_tokens = n;
         return lg;
     }
@@ -239,20 +536,44 @@ static float *eng_prefill(engine *e, const int *toks, int n) {
         // the delta-net state can't be rewound: continue from the current end, or from the
         // snapshot taken at the end of the last prompt, or start over
         if (!(common == e->n_ctx_tokens && common > 0)) {
-            if (e->snap_pos > 0 && common >= e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; e->qm.rope_delta = e->snap_delta; }
+            // the best in-memory snapshot, unless the disk has a longer saved prefix (another
+            // conversation came in between, or Quarry restarted)
+            const int mem = e->snap_pos > 0 && common >= e->snap_pos ? e->snap_pos : e->snap2_pos > 0 && common >= e->snap2_pos ? e->snap2_pos : 0;
+            int disk;
+            if ((disk = pc_load(e, toks, n, mem)) > 0) common = disk;
+            else if (mem && mem == e->snap_pos) { q35_state_load(&e->qm, e->snap); common = e->snap_pos; e->qm.rope_delta = e->snap_delta; }
+            else if (mem) { q35_state_load(&e->qm, e->snap2); common = e->snap2_pos; e->qm.rope_delta = e->snap2_delta; }
             else {
                 q35_state_reset(&e->qm);
                 common = 0;
                 e->qm.rope_delta = 0;
             }
+            (void)disk;
+        }
+        if (common < e->snap2_pos) e->snap2_pos = 0;
+        const int se = sys_end(e, toks, n);
+        const int from = common;   // tokens from here on are new in the cache
+        quarry_pf_done = from;
+        // a cancelled prefill keeps the tokens processed so far: the next request continues from them
+#define Q35_ABORTED() do { if (quarry_abort) { for (int i = from; i < quarry_pf_done; i++) e->ctx_tokens[i] = toks[i]; \
+            e->n_ctx_tokens = quarry_pf_done; return NULL; } } while (0)
+        if (se > common) {   // a second snapshot at the end of the system prompt
+            prefill(e, toks + common, se - common, common);
+            Q35_ABORTED();
+            q35_state_save(&e->qm, e->snap2); e->snap2_pos = se; e->snap2_delta = e->qm.rope_delta;
+            pc_save(e, toks, se);
+            common = se;
         }
         // snapshot before the final "<|im_start|>assistant": the next turn re-renders this
         // reply without its empty think block, so a snapshot at the very end would never match
         const int cut = snap_cut(e, toks, common, n);
         if (cut > common) prefill(e, toks + common, cut - common, common);
+        Q35_ABORTED();
         if (cut > common || e->snap_pos != cut) { q35_state_save(&e->qm, e->snap); e->snap_pos = cut; e->snap_delta = e->qm.rope_delta; }
         float *lg = prefill(e, toks + cut, n - cut, cut);
-        for (int i = common; i < n; i++) e->ctx_tokens[i] = toks[i];
+        Q35_ABORTED();
+#undef Q35_ABORTED
+        for (int i = from; i < n; i++) e->ctx_tokens[i] = toks[i];
         e->n_ctx_tokens = n;
         return lg;
     }
@@ -268,18 +589,18 @@ typedef int (*emit_fn)(const char *text, void *ud);
 // print one generated token (thinking/answer handling); nonzero to stop
 static int emit_tok(engine *e, int tok, int g, char *buf, int cap, emit_fn emit, void *ud) {
     int stop = 0;
-    if (e->lfm && tok == e->t_think_open && tok >= 0) {
+    if ((e->lfm || e->lag) && tok == e->t_think_open && tok >= 0) {
         e->mode = 1;   // the model opened a thinking block
         e->trim_lead = 1;
         if (e->show_thinking && !e->reason_emit) stop = emit("\033[2m", ud);
         return stop;
     }
-    if ((e->q35 || e->lfm) && tok == e->t_think_end && e->mode == 1) {
+    if ((e->q35 || e->lfm || e->lag) && tok == e->t_think_end && e->mode == 1) {
         // end of the thinking block: what follows is the answer
         if (e->show_thinking) stop = emit("\033[0m\n", ud);
         e->mode = 2;
-        e->trim_lead = e->lfm;
-    } else if ((e->q35 || e->lfm) && e->mode == 1) {
+        e->trim_lead = e->lfm || e->lag;
+    } else if ((e->q35 || e->lfm || e->lag) && e->mode == 1) {
         piece(e, tok, buf, cap);
         if (e->trim_lead) { char *b = buf; while (*b == '\n' || *b == ' ') b++; if (!*b) return 0; memmove(buf, b, strlen(b) + 1); e->trim_lead = 0; }
         if (e->reason_emit) stop = e->reason_emit(buf, ud);
@@ -432,9 +753,14 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     } else
 #endif
     {
-        n = tokenize(e, prompt, toks, e->n_ctx);
+        n = tokenize_reuse(e, prompt, toks, e->n_ctx);
         if (n < 0 || n >= e->n_ctx - 8) { emit("[prompt too long]", ud); free(toks); return; }
         lg = eng_prefill(e, toks, n);
+        if (!lg && quarry_abort) {   // cancelled while reading the prompt
+            st->prompt_tokens = n; st->t_prompt = now() - t0;
+            fprintf(stderr, "[cancelled during prompt processing: %d of %d tokens cached]\n", e->n_ctx_tokens, n);
+            free(toks); return;
+        }
     }
     // speed testing at long context without a long prefill: fill the attention KV cache up to
     // QUARRY_FAKE_CTX rows by repeating the prompt's rows, then generate after them
@@ -464,13 +790,16 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
         memset(lfm_prof, 0, sizeof lfm_prof);
         { extern double lfm_total; lfm_total = 0; }
         if (e->lfm) { e->lm.expert_bytes_read = 0; e->lm.pred_total = e->lm.pred_correct = 0; }
+        memset(lag_prof, 0, sizeof lag_prof);
+        if (e->lag) { e->gm.expert_bytes_read = 0; e->gm.pred_total = e->gm.pred_correct = 0; }
         if (e->q35) { e->qm.expert_bytes_read = 0; e->qm.draft_seconds = 0; e->qm.spec_steps = e->qm.spec_accepted = 0; e->qm.pred_total = e->qm.pred_correct = 0; }
     }
     st->t_prompt = now() - t0;
     t0 = now();
     char buf[256];
     int pos = n, g = 0;
-    e->mode = e->ink ? 0 : e->q35 && e->think ? 1 : 2;
+    e->mode = e->ink ? 0 : (e->q35 || e->lag) && e->think ? 1 : 2;
+    e->trim_lead = e->lag;   // Laguna: the answer starts on the line after the prompt's </think>
     // Qwen3.5/3.6 with an MTP layer: draft one token, verify two at a time (output unchanged:
     // greedy keeps the draft only if it is the argmax; sampling uses the speculative rule)
     const int spec = e->q35 && e->qm.has_mtp && !getenv("QUARRY_NO_SPEC");
@@ -523,10 +852,15 @@ static void eng_generate(engine *e, const char *prompt, int max_tokens, float te
     }
     st->gen_tokens = g;
     st->t_gen = now() - t0;
+    if (e->q35 && e->snap_pos >= 1024 && e->snap_pos != e->saved_pos && e->snap_delta == 0) {
+        pc_save_state(e, e->ctx_tokens, e->snap_pos, e->snap);
+        e->saved_pos = e->snap_pos;
+    }
     free(toks);
 }
 
 static char *chat_q35(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
+static char *chat_lag(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 static char *chat_mellum(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think);
 
 static engine *g_eng;
@@ -602,7 +936,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
         const char *tcnull[64] = {0};
         e->think = e->think_default;
         char *p = e->q35 && e->qm.c.mellum ? chat_mellum(roles, contents, tcnull, nm, NULL, e->think)
-                : e->q35 ? chat_q35(roles, contents, tcnull, nm, NULL, e->think) : chatml(roles, contents, nm);
+                : e->q35 ? chat_q35(roles, contents, tcnull, nm, NULL, e->think)
+                : e->lag ? chat_lag(roles, contents, tcnull, nm, NULL, e->think) : chatml(roles, contents, nm);
         char *reply = calloc(1, 1 << 20);
         gen_stats st = {0};
         acc_t acc = {reply, 0};
@@ -632,6 +967,8 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
             if (e->lfm) fprintf(stderr, " | prediction %.0f%% | conv %.1fs attn %.1fs (core %.1fs) dense %.1fs route %.1fs experts %.1fs output %.1fs",
                                 100.0 * e->lm.pred_correct / (e->lm.pred_total + 1e-9), lfm_prof[0], lfm_prof[1], lfm_prof[6], lfm_prof[2], lfm_prof[3], lfm_prof[4], lfm_prof[5]);
             if (e->ink) fprintf(stderr, " | ctrl %.1fs proj %.1fs small %.1fs core %.1fs", ink_prof[4], ink_prof[5], ink_prof[6], ink_prof[7]);
+            if (e->lag) fprintf(stderr, " | prediction %.0f%% | attn %.1fs (core %.1fs) dense+shared %.1fs route %.1fs experts %.1fs output %.1fs",
+                                100.0 * e->gm.pred_correct / (e->gm.pred_total + 1e-9), lag_prof[1], lag_prof[6], lag_prof[2], lag_prof[3], lag_prof[4], lag_prof[5]);
             fprintf(stderr, "]\n");
         }
         roles[nm] = "assistant"; contents[nm++] = reply;
@@ -780,6 +1117,21 @@ static void sb_putn(sbuf *b, const char *s, size_t n) {
     b->p[b->n] = 0;
 }
 static void sb_put(sbuf *b, const char *s) { sb_putn(b, s, strlen(s)); }
+
+// An assistant message's thinking (reasoning_content, as Quarry streams it) goes back into the
+// content as <think>...</think>, so the template can render it as the model generated it and the
+// prompt keeps matching the cache. Takes ownership of content.
+static char *with_reasoning(const char *msg, char *content) {
+    const char *r = json_get(msg, "reasoning_content");
+    if (!r) r = json_get(msg, "reasoning");
+    if (!r || *skip_ws(r) != '"' || strstr(content, "</think>")) return content;
+    char *rs = json_str(skip_ws(r), NULL);
+    if (!rs || !*rs) { free(rs); return content; }
+    sbuf b = {0};
+    sb_put(&b, "<think>"); sb_put(&b, rs); sb_put(&b, "</think>"); sb_put(&b, content);
+    free(rs); free(content);
+    return b.p;
+}
 
 // raw JSON text of the value at v (malloc'd)
 static char *json_raw(const char *v) {
@@ -969,12 +1321,25 @@ static char *chat_q35(const char **roles, const char **contents, const char **tc
         if (!strcmp(r, "user")) {
             sb_put(&b, "<|im_start|>user\n"); put_trimmed(&b, contents[i]); sb_put(&b, "<|im_end|>\n");
         } else if (!strcmp(r, "assistant")) {
-            // drop any reasoning from the content; after the last query keep an (empty) think block
-            const char *c = contents[i], *te = strstr(c, "</think>");
-            if (te) { c = te + 8; while (*c == '\n') c++; }
+            // keep the thinking when the client sends it back, written exactly as the model
+            // generated it ("<think>\n" + thinking + "</think>\n\n"), so the prompt matches the
+            // cache and the reply isn't read again (Qwen's preserve_thinking); without it, an
+            // empty think block after the last query, as the stock template does
+            const char *c = contents[i], *te = strstr(c, "</think>"), *rs = NULL;
+            size_t rl = 0;
+            if (te) {
+                const char *ts = strstr(c, "<think>");
+                rs = ts && ts < te ? ts + 7 : c;
+                if (*rs == '\n') rs++;
+                rl = te - rs;
+                c = te + 8; while (*c == '\n') c++;
+                const char *k = rs; while (k < te && (*k == '\n' || *k == ' ')) k++;
+                if (k == te) rs = NULL;   // only whitespace
+            }
             sbuf ct = {0}; put_trimmed(&ct, c);
             sb_put(&b, "<|im_start|>assistant\n");
-            if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
+            if (rs) { sb_put(&b, "<think>\n"); sb_putn(&b, rs, rl); if (rl && rs[rl - 1] != '\n') sb_put(&b, "\n"); sb_put(&b, "</think>\n\n"); }
+            else if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
             if (ct.n) sb_put(&b, ct.p);
             if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
                 const char *nx, *tc = json_arr_next(tcalls[i], &nx);
@@ -1040,9 +1405,22 @@ static char *chat_mellum(const char **roles, const char **contents, const char *
         if (!strcmp(r, "user") || (!strcmp(r, "system") && i > 0)) {
             sb_put(&b, "<|im_start|>"); sb_put(&b, r); sb_put(&b, "\n"); sb_put(&b, contents[i]); sb_put(&b, "<|im_end|>\n");
         } else if (!strcmp(r, "assistant")) {
-            const char *c = contents[i], *te = strstr(c, "</think>");
-            if (te) { c = te + 8; while (*c == '\n') c++; }
+            // thinking kept as generated when the client sends it back (see chat_q35), so the
+            // next prompt matches the cache; else an empty block after the last query
+            const char *c = contents[i], *te = strstr(c, "</think>"), *rs = NULL;
+            size_t rl = 0;
+            if (te) {
+                const char *ts = strstr(c, "<think>");
+                rs = ts && ts < te ? ts + 7 : c;
+                if (*rs == '\n') rs++;
+                rl = te - rs;
+                c = te + 8; while (*c == '\n') c++;
+                const char *k = rs; while (k < te && (*k == '\n' || *k == ' ')) k++;
+                if (k == te) rs = NULL;
+            }
             sb_put(&b, "<|im_start|>assistant\n");
+            if (rs) { sb_put(&b, "<think>\n"); sb_putn(&b, rs, rl); if (rl && rs[rl - 1] != '\n') sb_put(&b, "\n"); sb_put(&b, "</think>\n\n"); }
+            else if (i > last_q) sb_put(&b, "<think>\n\n</think>\n\n");
             sb_put(&b, c);
             if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
                 const char *nx, *tc = json_arr_next(tcalls[i], &nx);
@@ -1068,7 +1446,6 @@ static char *chat_mellum(const char **roles, const char **contents, const char *
             if (i == n - 1 || strcmp(roles[i + 1], "tool")) sb_put(&b, "<|im_end|>\n");
         }
     }
-    (void)last_q;
     // with thinking on the model opens <think> itself; starting it here keeps the tag out of the
     // streamed reasoning (same tokens either way)
     sb_put(&b, think ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>\n\n</think>\n\n");
@@ -1182,6 +1559,149 @@ static char *chat_lfm(const char **roles, const char **contents, const char **tc
     }
     sb_put(&b, "<|im_start|>assistant\n");
     return b.p;
+}
+
+// Laguna (the GGUF's template, laguna_glm_thinking_v4): "〈|EOS|〉", a <system> block with the
+// tools as JSON lines, <user>/<assistant>/<tool_response> blocks; an assistant turn always has
+// its reasoning (or a bare </think>) first; tool calls are
+// <tool_call>name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>.
+static void put_call(sbuf *out, int k, long id, const char *name, const char *args);
+static char *chat_lag(const char **roles, const char **contents, const char **tcalls, int n, const char *tools, int think) {
+    sbuf b = {0};
+    sb_put(&b, "〈|EOS|〉");
+    int i0 = 0;
+    const int has_tools = tools && *skip_ws(tools) == '[' && *skip_ws(skip_ws(tools) + 1) != ']';
+    const char *sys = n > 0 && !strcmp(roles[0], "system") ? contents[0] : NULL;
+    if (sys) i0 = 1;
+    int sys_has = 0;
+    if (sys) for (const char *c = sys; *c; c++) if (!isspace((unsigned char)*c)) { sys_has = 1; break; }
+    if (sys_has || has_tools) {
+        sb_put(&b, "<system>\n");
+        if (sys_has) {
+            size_t l = strlen(sys);
+            while (l && isspace((unsigned char)sys[l - 1])) l--;
+            sb_put(&b, "\n"); sb_putn(&b, sys, l);
+        }
+        if (has_tools) {
+            sb_put(&b, "\n\n### Tools\n\nYou may call functions to assist with the user query.\n"
+                       "All available function signatures are listed below:\n<available_tools>\n");
+            const char *nx, *t = json_arr_next(tools, &nx);
+            for (; t; t = json_arr_next(nx, &nx)) { char *raw = json_raw(t); sb_put(&b, raw); sb_put(&b, "\n"); free(raw); }
+            sb_put(&b, "</available_tools>\n\n");
+            if (think) sb_put(&b, "Wrap your thinking in '<think>', '</think>' tags, followed by a function call. For each function call, return an unescaped XML-like object with function name and arguments within '<tool_call>' and '</tool_call>' tags, like here:\n"
+                                  "<think> your thoughts here </think>\n");
+            else sb_put(&b, "For each function call, return an unescaped XML-like object with function name and arguments within '<tool_call>' and '</tool_call>' tags, like here:\n");
+            sb_put(&b, "<tool_call>function-name\n<arg_key>argument-key</arg_key>\n<arg_value>value-of-argument-key</arg_value>\n</tool_call>");
+        }
+        sb_put(&b, "\n</system>\n");
+    }
+    if (g_eng) { free(g_eng->sys_prefix); g_eng->sys_prefix = b.n > strlen("〈|EOS|〉") ? strdup(b.p) : NULL; }
+    for (int i = i0; i < n; i++) {
+        const char *c = contents[i] ? contents[i] : "";
+        if (!strcmp(roles[i], "user")) { sb_put(&b, "<user>\n"); sb_put(&b, c); sb_put(&b, "\n</user>\n"); }
+        else if (!strcmp(roles[i], "tool")) { sb_put(&b, "<tool_response>\n"); sb_put(&b, c); sb_put(&b, "\n</tool_response>\n"); }
+        else if (!strcmp(roles[i], "system")) { sb_put(&b, "<system>\n"); sb_put(&b, c); sb_put(&b, "\n</system>\n"); }
+        else if (!strcmp(roles[i], "assistant")) {
+            sb_put(&b, "<assistant>\n");
+            const char *te = strstr(c, "</think>");
+            if (te) {   // reasoning kept in the content: <think>...</think>answer
+                const char *rs = strstr(c, "<think>");
+                rs = rs && rs < te ? rs + 7 : c;
+                while (rs < te && isspace((unsigned char)*rs)) rs++;
+                const char *re = te;
+                while (re > rs && isspace((unsigned char)re[-1])) re--;
+                if (re > rs) { sb_put(&b, "<think>\n"); sb_putn(&b, rs, re - rs); sb_put(&b, "\n</think>\n"); }
+                else sb_put(&b, "</think>\n");
+                c = te + 8;
+            } else sb_put(&b, "</think>\n");
+            while (isspace((unsigned char)*c)) c++;
+            size_t l = strlen(c);
+            while (l && isspace((unsigned char)c[l - 1])) l--;
+            if (l) { sb_putn(&b, c, l); sb_put(&b, "\n"); }
+            if (tcalls[i] && *skip_ws(tcalls[i]) == '[') {
+                const char *nx, *tc = json_arr_next(tcalls[i], &nx);
+                for (; tc; tc = json_arr_next(nx, &nx)) {
+                    const char *f = json_get(tc, "function");
+                    if (!f) f = tc;
+                    const char *v;
+                    char *name = (v = json_get(f, "name")) ? json_str(skip_ws(v), NULL) : strdup("");
+                    sb_put(&b, "<tool_call>"); sb_put(&b, name); sb_put(&b, "\n");
+                    if ((v = json_get(f, "arguments"))) {
+                        char *args = *skip_ws(v) == '"' ? json_str(skip_ws(v), NULL) : json_raw(v);
+                        char *kk; const char *av, *it = skip_ws(args);
+                        if (*it == '{')
+                            while ((it = json_obj_next(it, &kk, &av))) {
+                                sb_put(&b, "<arg_key>"); sb_put(&b, kk); sb_put(&b, "</arg_key>\n<arg_value>");
+                                char *val = *skip_ws(av) == '"' ? json_str(skip_ws(av), NULL) : json_raw(av);
+                                sb_put(&b, val);
+                                sb_put(&b, "</arg_value>\n");
+                                free(val); free(kk);
+                            }
+                        free(args);
+                    }
+                    sb_put(&b, "</tool_call>\n");
+                    free(name);
+                }
+            }
+            sb_put(&b, "</assistant>\n");
+        }
+    }
+    sb_put(&b, think ? "<assistant>\n<think>" : "<assistant>\n</think>");
+    return b.p;
+}
+
+// Laguna tool calls: <tool_call>name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value>...</tool_call>;
+// values are raw text, typed by the tool's schema (as the Qwen XML form)
+static char *parse_tool_calls_lag(const char *text, const char *tools, long id, size_t *content_len) {
+    const char *first = strstr(text, "<tool_call>");
+    *content_len = first ? (size_t)(first - text) : strlen(text);
+    if (!first) return NULL;
+    sbuf out = {0};
+    sb_put(&out, "[");
+    int k = 0;
+    for (const char *p = first; (p = strstr(p, "<tool_call>"));) {
+        p += 11;
+        const char *end = strstr(p, "</tool_call>"), *body_end = end ? end : p + strlen(p);
+        while (*p == ' ' || *p == '\n') p++;
+        const char *ne = p;
+        while (ne < body_end && *ne != '\n' && *ne != '<') ne++;
+        const char *nt = ne;
+        while (nt > p && isspace((unsigned char)nt[-1])) nt--;
+        if (nt == p) break;
+        char *name = strndup(p, nt - p);
+        sbuf args = {0};
+        sb_put(&args, "{");
+        int na = 0;
+        for (const char *q = ne; (q = strstr(q, "<arg_key>")) && q < body_end;) {
+            q += 9;
+            const char *qe = strstr(q, "</arg_key>");
+            if (!qe || qe > body_end) break;
+            char *pname = strndup(q, qe - q);
+            const char *vs = strstr(qe, "<arg_value>");
+            if (!vs || vs > body_end) { free(pname); break; }
+            vs += 11;
+            const char *ve = strstr(vs, "</arg_value>");
+            if (!ve || ve > body_end) ve = body_end;
+            char *val = strndup(vs, ve - vs);
+            char *ty = tool_param_type(tools, name, pname);
+            size_t cap = strlen(pname) * 6 + 16;
+            char *pesc = malloc(cap);
+            json_escape(pname, pesc, cap);
+            if (na++) sb_put(&args, ",");
+            sb_put(&args, "\""); sb_put(&args, pesc); sb_put(&args, "\":");
+            put_arg_value(&args, val, ty);
+            free(pesc); free(ty); free(val); free(pname);
+            q = ve;
+        }
+        sb_put(&args, "}");
+        put_call(&out, k++, id, name, args.p);
+        free(args.p); free(name);
+        if (!end) break;
+        p = end + 12;
+    }
+    sb_put(&out, "]");
+    if (k == 0) { free(out.p); *content_len = strlen(text); return NULL; }
+    return out.p;
 }
 
 // ---- LFM tool calls: <|tool_call_start|>[f(a=1, b="x"), g()]<|tool_call_end|> ----
@@ -1328,6 +1848,7 @@ static char *parse_tool_calls_lfm(const char *text, long id, size_t *content_len
 // JSON array (NULL when there are no calls)
 static char *parse_tool_calls(const char *text, const char *tools, long id, size_t *content_len) {
     if (g_eng && g_eng->lfm) return parse_tool_calls_lfm(text, id, content_len);
+    if (g_eng && g_eng->lag) return parse_tool_calls_lag(text, tools, id, content_len);
     const char *first = strstr(text, "<tool_call>");
     *content_len = first ? (size_t)(first - text) : strlen(text);
     if (!first) return NULL;
@@ -1407,7 +1928,7 @@ static void send_all(int fd, const char *b, size_t n) {
     while (n) { ssize_t w = send(fd, b, n, MSG_NOSIGNAL); if (w <= 0) return; b += w; n -= w; }
 }
 
-typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent; int in_call;
+typedef struct { int fd; int stream; char *acc; size_t acc_len, acc_cap; int broken; long id; int tools; size_t sent, tsent; int in_call;
                  char pend[2][8]; int npend[2];   // pend: an incomplete UTF-8 character per field
                  engine *e; char job[64];          // job: chat-page id; then generation continues if the client goes away
                  char *racc; size_t racc_len, racc_cap; int cancelled; } req_ctx;
@@ -1444,6 +1965,19 @@ static void send_last_job(engine *e, int fd, int running) {
 
 // called between tokens: take connections that arrived meanwhile. A cancel for this request stops
 // it; anything else waits in e->pend_fd until the generation ends.
+static int serve_poll(req_ctx *r);
+static req_ctx *g_poll_req;   // the request being served: prompt processing polls the listener for it
+static void prefill_poll(void) {
+    if (!g_poll_req) return;
+    req_ctx *r = g_poll_req;
+    // the client hung up (Esc, timeout): stop reading its prompt, unless it is a chat-page job that
+    // finishes in the background
+    if (!r->job[0] && r->fd > 0) {
+        struct pollfd p = {r->fd, POLLRDHUP, 0};
+        if (poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR))) r->cancelled = 1;
+    }
+    if (serve_poll(r) || r->cancelled) quarry_abort = 1;
+}
 static int serve_poll(req_ctx *r) {
     engine *e = r->e;
     if (!e || e->listen_fd <= 0) return 0;
@@ -1554,7 +2088,17 @@ static int emit_http(const char *t, void *ud) {
     r->acc_len += l;
     r->acc[r->acc_len] = 0;
     if (serve_poll(r)) return 1;
-    if (!r->stream || r->in_call) return 0;
+    if (!r->stream) return 0;
+    if (r->in_call) {
+        // the tool call being written: its raw text goes in a separate field (clients that know it
+        // show progress, the others ignore it); the parsed call is still sent at the end
+        if (r->tsent < r->sent) r->tsent = r->sent;
+        size_t n = r->acc_len - r->tsent;
+        if (!n) return 0;
+        int bad = send_delta_field(r, "tool_call_text", r->acc + r->tsent, n);
+        r->tsent = r->acc_len;
+        return bad;
+    }
     if (!r->tools) { size_t n = r->acc_len - r->sent; r->sent = r->acc_len; return send_delta(r, r->acc + r->acc_len - n, n); }
     // tools on: never stream the <tool_call> markup; hold back a possible start of it
     const char *tag = g_eng && g_eng->lfm ? "<|tool_call_start|>" : "<tool_call>";
@@ -1656,7 +2200,7 @@ static void handle(engine *e, int fd) {
             "{\"model\":\"%s\",\"arch\":\"%s\",\"n_ctx\":%d,\"ctx_used\":%d,\"cache_gb\":%.1f,"
             "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
             "\"vision\":%s,\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
-            e->model_name, e->lfm ? "lfm2moe" : e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
+            e->model_name, e->lag ? "laguna" : e->lfm ? "lfm2moe" : e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
             getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
             h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
             e->mctx ? "true" : "false", e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
@@ -1680,7 +2224,7 @@ static void handle(engine *e, int fd) {
                 const char *r = json_get(v, "role"), *c = json_get(v, "content");
                 roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
                 if (!strcmp(roles[nm], "developer")) { free((char *)roles[nm]); roles[nm] = strdup("system"); }   // OpenAI's newer name for system
-                contents[nm] = c ? content_text(c) : strdup("");
+                contents[nm] = with_reasoning(v, c ? content_text(c) : strdup(""));
                 tcalls[nm] = json_get(v, "tool_calls");
                 nm++;
                 v = skip_ws(json_skip(v));
@@ -1702,7 +2246,8 @@ static void handle(engine *e, int fd) {
         if (ck && (v = json_get(ck, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
         if ((v = json_get(body, "enable_thinking"))) think = !strncmp(skip_ws(v), "true", 4);
         e->think = think;
-        char *prompt = e->lfm ? chat_lfm(roles, contents, tcalls, nm, tools)
+        char *prompt = e->lag ? chat_lag(roles, contents, tcalls, nm, tools, think)
+                     : e->lfm ? chat_lfm(roles, contents, tcalls, nm, tools)
                      : e->ink ? chatml(roles, contents, nm)
                      : e->q35 && e->qm.c.mellum ? chat_mellum(roles, contents, tcalls, nm, tools, think)
                      : e->q35 ? chat_q35(roles, contents, tcalls, nm, tools, think)
@@ -1722,7 +2267,9 @@ static void handle(engine *e, int fd) {
         }
         gen_stats st = {0};
         e->reason_emit = emit_reason_http;
+        g_poll_req = &rc; quarry_poll = prefill_poll; quarry_abort = 0;
         eng_generate(e, prompt, max_tokens, temp, top_p, emit_http, &rc, &st);
+        g_poll_req = NULL; quarry_abort = 0;
         e->reason_emit = NULL;
         e->last_prompt = st.prompt_tokens; e->last_gen = st.gen_tokens;
         e->last_t_prompt = st.t_prompt; e->last_t_gen = st.t_gen;
@@ -1808,7 +2355,7 @@ static int cmd_serve(engine *e, const char *host, int port) {
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
     inet_pton(AF_INET, host, &a.sin_addr);
-    if (bind(s, (struct sockaddr *)&a, sizeof a) || listen(s, 16)) { perror("bind"); return 1; }
+    if (bind(s, (struct sockaddr *)&a, sizeof a) || listen(s, 128)) { perror("bind"); return 1; }
     fprintf(stderr, "quarry: serving OpenAI-compatible API on http://%s:%d/v1\n", host, port);
     e->listen_fd = s;
     for (;;) {
@@ -1816,6 +2363,14 @@ static int cmd_serve(engine *e, const char *host, int port) {
         if (e->n_pend) {   // connections that arrived during the last generation, oldest first
             c = e->pend_fd[0];
             memmove(e->pend_fd, e->pend_fd + 1, --e->n_pend * sizeof(int));
+            // a client that gave up while it waited (timeout, retry) has closed its end: drop the
+            // request instead of spending minutes on a reply nobody reads
+            struct pollfd pf = {c, POLLRDHUP, 0};
+            if (poll(&pf, 1, 0) > 0 && (pf.revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+                fprintf(stderr, "[dropped a queued request: the client already disconnected]\n");
+                close(c);
+                continue;
+            }
         } else if ((c = accept(s, NULL, NULL)) < 0) continue;
         handle(e, c);
         close(c);
@@ -1965,6 +2520,7 @@ static int cmd_bench_prefill(engine *e, const char *path) {
         printf("%s: %d tokens in %.1fs = %.1f tok/s | SSD %.2f GB | attn mm %.1fs, attn %.1fs, route %.1fs, experts %.1fs (io wait %.1fs, gate+up %.1fs, down %.1fs)\n",
                run ? "warm" : "cold", n, dt, n / dt, (bytes_read(e) - b0) / 1e9,
                qt_pf[0], qt_pf[1], qt_pf[2], qt_pf[3], qt_pf[4], qt_pf[5], qt_pf[6]);
+        if (e->lag) { printf("  laguna: attention %.1fs (core %.1fs), dense+shared %.1fs, route %.1fs, experts %.1fs (io wait %.1fs), output %.1fs, matvec regions %.1fs\n", lag_prof[1], lag_prof[6], lag_prof[2], lag_prof[3], lag_prof[4], lag_prof[0], lag_prof[5], lag_prof[7]); memset(lag_prof, 0, sizeof lag_prof); }
         if (e->lfm) { printf("  lfm2: conv %.1fs, attention %.1fs (core %.1fs), dense %.1fs, route %.1fs, experts %.1fs, output %.1fs\n", lfm_prof[0], lfm_prof[1], lfm_prof[6], lfm_prof[2], lfm_prof[3], lfm_prof[4], lfm_prof[5]); memset(lfm_prof, 0, sizeof lfm_prof); }
         if (e->q35) printf("  q35: delta-net %.1fs (proj %.1fs, conv+norm %.1fs, recur %.1fs), attention %.1fs (core %.1fs), moe %.1fs\n", q35_prof[0], q35_prof[6], q35_prof[7], q35_prof[4], q35_prof[1], q35_mp[7], q35_prof[3]);
         if (e->q35) printf("  moe: shared %.1fs, route %.1fs, cached experts %.1fs, streamed %.1fs, stream wait %.1fs | repack (thread 0) q3k %.1fs, other %.1fs\n", q35_mp[0], q35_mp[1], q35_mp[2], q35_mp[3], q35_mp[4], q35_mp[5], q35_mp[6]);
@@ -2026,7 +2582,7 @@ static int cmd_debug_tools(int argc, char **argv) {
             const char *r = json_get(v, "role"), *c = json_get(v, "content");
             roles[nm] = r ? json_str(skip_ws(r), NULL) : strdup("user");
                 if (!strcmp(roles[nm], "developer")) { free((char *)roles[nm]); roles[nm] = strdup("system"); }   // OpenAI's newer name for system
-            contents[nm] = c ? content_text(c) : strdup("");
+            contents[nm] = with_reasoning(v, c ? content_text(c) : strdup(""));
             tcalls[nm] = json_get(v, "tool_calls");
             nm++;
             v = skip_ws(json_skip(v));

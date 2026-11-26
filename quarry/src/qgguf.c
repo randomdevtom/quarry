@@ -195,7 +195,7 @@ const qg_tensor *qg_find_tensor(const qg_file *g, const char *name) {
 
 size_t qg_type_block_bytes(int type) {
     switch (type) {
-    case GT_F32: return 4;    case GT_F16: return 2;
+    case GT_F32: return 4;    case GT_F16: return 2;    case GT_BF16: return 2;
     case GT_Q4_0: return 18;  case GT_Q4_1: return 20;  case GT_Q5_0: return 22; case GT_Q8_0: return 34;
     case GT_Q2_K: return 84;  case GT_Q3_K: return 110;
     case GT_Q4_K: return 144; case GT_Q5_K: return 176; case GT_Q6_K: return 210;
@@ -205,7 +205,7 @@ size_t qg_type_block_bytes(int type) {
 
 int qg_type_block_elems(int type) {
     switch (type) {
-    case GT_F32: case GT_F16: return 1;
+    case GT_F32: case GT_F16: case GT_BF16: return 1;
     case GT_Q4_0: case GT_Q4_1: case GT_Q5_0: case GT_Q8_0: return 32;
     case GT_Q2_K: case GT_Q3_K: case GT_Q4_K: case GT_Q5_K: case GT_Q6_K: return 256;
     default: return 0;
@@ -214,7 +214,7 @@ int qg_type_block_elems(int type) {
 
 const char *qg_type_name(int type) {
     switch (type) {
-    case GT_F32: return "F32";   case GT_F16: return "F16";
+    case GT_F32: return "F32";   case GT_F16: return "F16";   case GT_BF16: return "BF16";
     case GT_Q4_0: return "Q4_0"; case GT_Q4_1: return "Q4_1"; case GT_Q5_0: return "Q5_0"; case GT_Q8_0: return "Q8_0";
     case GT_Q2_K: return "Q2_K"; case GT_Q3_K: return "Q3_K";
     case GT_Q4_K: return "Q4_K"; case GT_Q5_K: return "Q5_K"; case GT_Q6_K: return "Q6_K";
