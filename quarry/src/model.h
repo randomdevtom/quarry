@@ -73,11 +73,18 @@ typedef struct {
     // optional: called by the I/O thread on each part after it is read (e.g. an in-place repack)
     void (*fixup)(void *ud, int layer, int part, uint8_t *data, uint64_t bytes);
     void *fixup_ud;
+    // for sizing the RAM cache automatically (QUARRY_CACHE_GB unset): expert bytes already held
+    // elsewhere (VRAM), and RAM the model will still need besides the cache (e.g. KV at full context)
+    uint64_t elsewhere, reserve;
 } expert_src;
 // write src's experts to `path`, each expert's parts back to back in its cache-slot layout,
 // so a miss is one contiguous read. Returns 0 on success.
 int experts_write_packed(const expert_src *src, const char *path);
 struct expert_store *experts_open_src(const expert_src *src);
+// size of the RAM expert cache in GB (what QUARRY_CACHE_GB says, or what was picked automatically)
+double experts_cache_gb(const struct expert_store *s);
+// move expert e of layer l to the front of the eviction queue (e.g. it now lives in VRAM)
+void experts_drop(struct expert_store *s, int l, int e);
 struct expert_store *experts_open(qmodel *m);
 // returns pointers to gate/up/down weights of expert e in layer l, valid until next call
 void experts_get(struct expert_store *s, int l, int e, const uint8_t **gate, const uint8_t **up,

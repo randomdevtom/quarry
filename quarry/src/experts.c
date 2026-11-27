@@ -59,7 +59,52 @@ struct expert_store {
     // stats
     uint64_t hits, misses, prefetch_issued, prefetch_useful;
     double wait_s;              // time the compute thread spent blocked on I/O
+    double cache_gb;
 };
+
+// RAM the system can still give us, from /proc/meminfo (bytes), or 0
+// room left under this process's cgroup v2 memory limit (bytes), or 0 if there is none
+static double cgroup_room(void) {
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (!f) return 0;
+    char line[1024], path[1200];
+    double room = 0;
+    if (fgets(line, sizeof line, f) && !strncmp(line, "0::", 3)) {
+        line[strcspn(line, "\n")] = 0;
+        // the limit can be set on this group or any parent: take the tightest
+        for (char *end = line + strlen(line); end >= line + 3; ) {
+            *end = 0;
+            snprintf(path, sizeof path, "/sys/fs/cgroup%s/memory.max", line + 3);
+            FILE *m = fopen(path, "r");
+            double mx = 0, cur = 0;
+            char v[64] = "";
+            if (m) { if (fgets(v, sizeof v, m) && strncmp(v, "max", 3)) mx = atof(v); fclose(m); }
+            if (mx > 0) {
+                snprintf(path, sizeof path, "/sys/fs/cgroup%s/memory.current", line + 3);
+                if ((m = fopen(path, "r"))) { if (fgets(v, sizeof v, m)) cur = atof(v); fclose(m); }
+                const double r = mx - cur;
+                if (room == 0 || r < room) room = r > 1 ? r : 1;
+            }
+            char *slash = strrchr(line + 3, '/');
+            if (!slash || slash == line + 3) break;
+            end = slash;
+        }
+    }
+    fclose(f);
+    return room;
+}
+
+static double meminfo(const char *key) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    double v = 0;
+    const size_t kl = strlen(key);
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, kl) && line[kl] == ':') { v = atof(line + kl + 1) * 1024; break; }
+    fclose(f);
+    return v;
+}
 
 #include <time.h>
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -374,9 +419,30 @@ struct expert_store *experts_open_src(const expert_src *src) {
         cls_layers[c]++;
     }
     // same cached fraction of experts in every class
-    double gb = getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5;
     double all = 0;
     for (int l = 0; l < s->n_layer; l++) all += (double)lsize[l] * s->n_expert;
+    double gb;
+    if (getenv("QUARRY_CACHE_GB")) gb = atof(getenv("QUARRY_CACHE_GB"));
+    else {
+        // automatic: what is available, minus what the model still needs (part of the KV at full
+        // context), minus headroom; never more than the experts that are not in VRAM. Where
+        // /proc/meminfo cannot be read, the old default.
+        double avail = meminfo("MemAvailable"), total = meminfo("MemTotal");
+        const double lim = cgroup_room();   // under a memory limit (systemd, containers), that counts
+        // headroom for the rest of the system (1 GB + 5% of RAM); under a memory limit that is
+        // tighter than the system's, the limit already protects the rest, so only a little
+        double headroom = 1.0e9 + 0.05 * total;
+        if (lim > 0 && lim < avail) { avail = lim; headroom = 0.25e9; }
+        if (avail > 0) {
+            gb = (avail - (double)src->reserve - headroom) / 1e9;
+            const double need = (all - (double)src->elsewhere) / 1e9;
+            if (gb > need) gb = need;
+            if (gb < 0.5) gb = 0.5;
+            fprintf(stderr, "quarry: RAM expert cache %.1f GB (auto: %.1f GB available%s; QUARRY_CACHE_GB overrides)\n",
+                    gb, avail / 1e9, src->elsewhere ? ", experts in VRAM excluded" : "");
+        } else gb = 5.5;
+    }
+    s->cache_gb = gb;
     double frac = gb * 1e9 / all;
     if (frac > 1) frac = 1;
     int cls_slots[64], total = 0;
@@ -611,6 +677,23 @@ void experts_stream_done(struct expert_store *s, int h) {
 }
 
 // mispredicted prefetches: move to the LRU tail so they are evicted first
+double experts_cache_gb(const struct expert_store *s) { return s->cache_gb; }
+
+void experts_drop(struct expert_store *s, int l, int e) {
+    pthread_mutex_lock(&s->mu);
+    int i = s->map[l * s->n_expert + e];
+    if (i >= 0 && !s->slots[i].pins && s->slots[i].state == S_READY && s->tail != i) {
+        lru_unlink(s, i);
+        slot_t *x = &s->slots[i];
+        x->next = -1;
+        x->prev = s->tail;
+        if (s->tail >= 0) s->slots[s->tail].next = i;
+        s->tail = i;
+        if (s->head < 0) s->head = i;
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+
 void experts_demote(struct expert_store *s, int l, const int *sel, int k) {
     pthread_mutex_lock(&s->mu);
     for (int j = 0; j < k; j++) {

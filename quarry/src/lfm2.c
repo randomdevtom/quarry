@@ -239,7 +239,7 @@ int lfm_load(lfm_model *m, const char *path, int n_ctx) {
             if (L->is_moe) all += (double)(L->gate_exps.row_bytes * L->gate_exps.rows + L->up_exps.row_bytes * L->up_exps.rows +
                                            L->down_exps.row_bytes * L->down_exps.rows) * c->n_expert;
         }
-        const double gb = getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5;
+        const double gb = experts_cache_gb(m->experts);
         if (gb * 1e9 >= all * 1.01 && !getenv("QUARRY_NO_PRELOAD")) {
             int ids[256];
             for (int e = 0; e < c->n_expert; e++) ids[e] = e;

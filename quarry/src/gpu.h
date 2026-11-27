@@ -22,7 +22,11 @@ void gpu_close(qgpu *g);
 int gpu_slot(const qgpu *g, int l, int e);
 // the CPU just computed expert e of layer l (its weights are in RAM at gate/up/down): count the
 // use, and copy it into VRAM if it has become hot enough. Call outside a gpu_moe_start/finish pair.
-void gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, const uint8_t *down);
+// Returns 1 if it was copied in (the RAM copy is then no longer needed).
+int gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, const uint8_t *down);
+// VRAM used for experts; whether the GPU's memory is system RAM (integrated GPU)
+uint64_t gpu_bytes(const qgpu *g);
+int gpu_shares_ram(const qgpu *g);
 
 // start the GPU part of layer l for T tokens (T <= 2): X is T rows of D floats; per token, n
 // (slot, weight) pairs in slot[t * n + j], w[t * n + j] (pad with weight 0). Asynchronous.

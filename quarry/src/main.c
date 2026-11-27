@@ -3,7 +3,7 @@
 //   quarry run   -m model.gguf [-p "prompt"] [-n 512] [--temp 0.7]
 //   quarry serve -m model.gguf [--port 8090] [--host 127.0.0.1]
 //
-// Env: QUARRY_CACHE_GB (expert cache size, default 5.5), QUARRY_IO_THREADS (2)
+// Env: QUARRY_CACHE_GB (expert cache size, default: from available RAM), QUARRY_IO_THREADS (2)
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <llama.h>
@@ -2260,7 +2260,7 @@ static void handle(engine *e, int fd) {
             "\"cache_hit\":%.4f,\"ssd_gb\":%.2f,\"speculative\":%s,\"draft_accept\":%.4f,"
             "\"vision\":%s,\"requests\":%ld,\"last\":{\"prompt_tokens\":%d,\"prompt_s\":%.2f,\"gen_tokens\":%d,\"gen_s\":%.2f}}",
             e->model_name, e->lag ? "laguna" : e->lfm ? "lfm2moe" : e->q35 ? (e->qm.c.mellum ? "mellum" : "qwen35moe") : e->ink ? "inkling2" : "qwen3moe", e->n_ctx, e->n_ctx_tokens,
-            getenv("QUARRY_CACHE_GB") ? atof(getenv("QUARRY_CACHE_GB")) : 5.5,
+            experts_cache_gb(es),
             h + mi ? (double)h / (h + mi) : 0, bytes_read(e) / 1e9, spec ? "true" : "false", acc,
             e->mctx ? "true" : "false", e->n_requests, e->last_prompt, e->last_t_prompt, e->last_gen, e->last_t_gen);
         int n = snprintf(hdr, sizeof hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n%sContent-Length: %d\r\n\r\n", cors, bl);
@@ -2474,7 +2474,8 @@ static void usage(void) {
             "  models: Qwen3-MoE (qwen3moe), Inkling 2 (inkling2_loop; --effort 0..0.99 thinking, default 0.2)\n"
             "  --skip 0.1   Inkling, lossy: skip experts not in RAM whose routing weight is < 10%% (faster, output changes)\n"
             "  --experts N  experts per token (default: 6 of 8 for Qwen3-Coder, all 8 otherwise; fewer = faster, lossy)\n\n"
-            "env: QUARRY_CACHE_GB (expert cache, default 5.5)  QUARRY_IO_THREADS (default 2)\n");
+            "env: QUARRY_CACHE_GB (RAM expert cache; default: sized from available RAM)  QUARRY_IO_THREADS (default 2)\n"
+            "     QUARRY_GPU_GB (VRAM for experts; default: free VRAM - 1 GB, GPU builds)  QUARRY_GPU=0 (CPU only)\n");
 }
 
 // prompt processing speed: run the same prompt twice (cold, then warm cache)

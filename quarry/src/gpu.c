@@ -10,7 +10,9 @@ qgpu *gpu_open(int n_layer, int n_expert, int n_used, int D, int F, const int *t
 }
 void gpu_close(qgpu *g) { (void)g; }
 int gpu_slot(const qgpu *g, int l, int e) { (void)g; (void)l; (void)e; return -1; }
-void gpu_offer(qgpu *g, int l, int e, const uint8_t *a, const uint8_t *b, const uint8_t *c) { (void)g; (void)l; (void)e; (void)a; (void)b; (void)c; }
+int gpu_offer(qgpu *g, int l, int e, const uint8_t *a, const uint8_t *b, const uint8_t *c) { (void)g; (void)l; (void)e; (void)a; (void)b; (void)c; return 0; }
+uint64_t gpu_bytes(const qgpu *g) { (void)g; return 0; }
+int gpu_shares_ram(const qgpu *g) { (void)g; return 0; }
 void gpu_moe_start(qgpu *g, int l, int T, const float *const *X, int n, const int *slot, const float *w) { (void)g; (void)l; (void)T; (void)X; (void)n; (void)slot; (void)w; }
 void gpu_moe_finish(qgpu *g, float *const *out) { (void)g; (void)out; }
 void gpu_stats(const qgpu *g, char *buf, int len) { (void)g; if (len) buf[0] = 0; }
@@ -59,6 +61,8 @@ struct qgpu {
     uint64_t calls, experts_gpu, uploads, evictions;
     double wait_s;
     char name[128];
+    uint64_t bytes;
+    int integrated;
 };
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -153,6 +157,8 @@ qgpu *gpu_open(int n_layer, int n_expert, int n_used, int D, int F, const int *t
     }
     if (!g->wbuf) { fprintf(stderr, "quarry: could not allocate GPU memory, GPU not used\n"); gpu_close(g); return NULL; }
     g->cap = cap;
+    g->bytes = (uint64_t)(per * cap);
+    g->integrated = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
     g->slot_of = malloc(sizeof(int) * n_layer * n_expert);
     for (int i = 0; i < n_layer * n_expert; i++) g->slot_of[i] = -1;
     g->owner = malloc(sizeof(int) * n_layer * cap);
@@ -194,12 +200,15 @@ void gpu_close(qgpu *g) {
 
 int gpu_slot(const qgpu *g, int l, int e) { return g ? g->slot_of[l * g->n_expert + e] : -1; }
 
-void gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, const uint8_t *down) {
-    if (!g || g->busy) return;
+uint64_t gpu_bytes(const qgpu *g) { return g ? g->bytes : 0; }
+int gpu_shares_ram(const qgpu *g) { return g ? g->integrated : 0; }
+
+int gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, const uint8_t *down) {
+    if (!g || g->busy) return 0;
     if (l <= g->last_l) { g->tick++; g->uploads_tick = 0; }   // layers restart: next token
     g->last_l = l;
     const int key = l * g->n_expert + e;
-    if (g->slot_of[key] >= 0) return;
+    if (g->slot_of[key] >= 0) return 0;
     const float sc = score_now(g, key) + 1;
     g->score[key] = sc;
     // a free slot, or the coldest resident expert if this one is clearly hotter
@@ -211,11 +220,11 @@ void gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, co
         const float os = score_now(g, l * g->n_expert + o);
         if (os < vs) { vs = os; victim = s; }
     }
-    if (victim < 0) return;
+    if (victim < 0) return 0;
     if (vs >= 0) {
-        if (sc < 2 * vs + 2) return;              // hysteresis: no thrashing
-        if (g->uploads_tick >= 8) return;         // bound the copying per token once VRAM is full
-    } else if (g->uploads_tick >= 96) return;     // first fill: faster, still bounded
+        if (sc < 2 * vs + 2) return 0;            // hysteresis: no thrashing
+        if (g->uploads_tick >= 8) return 0;       // bound the copying per token once VRAM is full
+    } else if (g->uploads_tick >= 96) return 0;   // first fill: faster, still bounded
     const uint8_t *src[3] = {gate, up, down};
     for (int p = 0; p < 3; p++) {
         struct ggml_tensor *t = g->W[l * 3 + p];
@@ -227,6 +236,7 @@ void gpu_offer(qgpu *g, int l, int e, const uint8_t *gate, const uint8_t *up, co
     g->slot_of[key] = victim;
     g->uploads++;
     g->uploads_tick++;
+    return 1;
 }
 
 static void run_job(qgpu *g) {

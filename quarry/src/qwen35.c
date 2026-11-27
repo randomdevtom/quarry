@@ -339,16 +339,9 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     }
     expert_src src = {g->fd, g->file_size, nl, c->n_expert, 3, off, bytes,
                       &m->expert_bytes_read, &m->expert_loads, 2 * c->n_used + 4};
-    // <model>.experts: experts repacked so each one is a single contiguous read. Faster in a
-    // raw read test (1.45 vs 1.07 GB/s) but slower inside the engine on our laptop (I/O wait
-    // 21s vs 14s), so opt-in: QUARRY_WRITE_PACKED=1 creates it, QUARRY_PACKED=1 uses it.
-    char packed[4096];
-    snprintf(packed, sizeof packed, "%s.experts", path);
-    if (getenv("QUARRY_WRITE_PACKED") && experts_write_packed(&src, packed)) fprintf(stderr, "quarry: packing failed\n");
-    if (getenv("QUARRY_PACKED") && access(packed, R_OK) == 0) src.packed = packed;
-    m->experts = experts_open_src(&src);
-    free(off); free(bytes);
-    {   // GPU tier for the hottest experts (QUARRY_GPU=0 turns it off, QUARRY_GPU_GB sets its size)
+    // memory tiers, fastest first: VRAM (the hottest experts), then the RAM cache (sized from what
+    // is left: QUARRY_CACHE_GB, or automatic), then the SSD for the rest
+    {   // GPU tier (QUARRY_GPU=0 turns it off, QUARRY_GPU_GB sets its size)
         int *ty = malloc(nl * 3 * sizeof(int));
         for (int l = 0; l < nl; l++) {
             ty[l * 3 + 0] = m->layers[l].gate_exps.type;
@@ -358,6 +351,23 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
         m->gpu = gpu_open(nl, c->n_expert, c->n_used, c->n_embd, c->n_ff, ty, getenv("QUARRY_GPU_GB") ? atof(getenv("QUARRY_GPU_GB")) : 0);
         free(ty);
     }
+    if (m->gpu) {
+        src.elsewhere = gpu_bytes(m->gpu);
+        if (gpu_shares_ram(m->gpu)) src.reserve += gpu_bytes(m->gpu);   // integrated GPU: its "VRAM" is RAM
+    }
+    {   // KV is file-backed (the kernel can write it out), so only part of it is set aside
+        const uint64_t kv = (uint64_t)(m->n_attn + m->has_mtp) * n_ctx * c->n_head_kv * c->hd * 2 * 2;
+        src.reserve += kv < (2ull << 30) ? kv : (2ull << 30);
+    }
+    // <model>.experts: experts repacked so each one is a single contiguous read. Faster in a
+    // raw read test (1.45 vs 1.07 GB/s) but slower inside the engine on our laptop (I/O wait
+    // 21s vs 14s), so opt-in: QUARRY_WRITE_PACKED=1 creates it, QUARRY_PACKED=1 uses it.
+    char packed[4096];
+    snprintf(packed, sizeof packed, "%s.experts", path);
+    if (getenv("QUARRY_WRITE_PACKED") && experts_write_packed(&src, packed)) fprintf(stderr, "quarry: packing failed\n");
+    if (getenv("QUARRY_PACKED") && access(packed, R_OK) == 0) src.packed = packed;
+    m->experts = experts_open_src(&src);
+    free(off); free(bytes);
     m->prefetch_on = getenv("QUARRY_NO_PREFETCH") ? 0 : 1;
     return 0;
 }
@@ -1219,8 +1229,9 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
         for (int k = 0; k < KC; k++) {   // hot ones get copied into VRAM
             const uint8_t *a, *b, *d;
             experts_get(m->experts, l, sel[k], &a, &b, &d);
-            gpu_offer(m->gpu, l, sel[k], a, b, d);
+            const int moved = gpu_offer(m->gpu, l, sel[k], a, b, d);
             experts_release(m->experts, l, sel[k]);
+            if (moved) experts_drop(m->experts, l, sel[k]);   // it lives in VRAM now: free its RAM slot first
         }
     }
     q35_prof[3] += qnow() - t0;
@@ -1637,8 +1648,9 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
         for (int k = 0; k < nu; k++) {
             const uint8_t *a, *b, *d;
             experts_get(m->experts, l, U[k], &a, &b, &d);
-            gpu_offer(m->gpu, l, U[k], a, b, d);
+            const int moved = gpu_offer(m->gpu, l, U[k], a, b, d);
             experts_release(m->experts, l, U[k]);
+            if (moved) experts_drop(m->experts, l, U[k]);
         }
     }
     q35_prof[3] += qnow() - t0;
