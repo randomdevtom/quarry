@@ -4,15 +4,22 @@ LDLIBS  = -lm -lpthread
 # tokenizer: libllama. A recent llama.cpp is needed for Inkling 2 (inkling2_loop);
 # vendor/llama.cpp is used when it has been built, the system libllama otherwise.
 LLAMA_DIR ?= ../vendor/llama.cpp
-ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libllama.so),)
-LLAMA_FLAGS = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -L$(LLAMA_DIR)/build/bin -Wl,-rpath,$(abspath $(LLAMA_DIR)/build/bin)
+LLAMA_BUILD ?= build
+LLAMA_BIN = $(LLAMA_DIR)/$(LLAMA_BUILD)/bin
+ifneq ($(wildcard $(LLAMA_BIN)/libllama.so),)
+LLAMA_FLAGS = -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include -L$(LLAMA_BIN) -Wl,-rpath,$(abspath $(LLAMA_BIN))
 endif
 LLAMA_LIBS = $(LLAMA_FLAGS) -lllama -lggml -lggml-base
 # vision (Qwen3.5/3.6 images): llama.cpp's libmtmd, when it has been built
-ifneq ($(wildcard $(LLAMA_DIR)/build/bin/libmtmd.so),)
+ifneq ($(wildcard $(LLAMA_BIN)/libmtmd.so),)
 LLAMA_LIBS += -I$(LLAMA_DIR)/tools/mtmd -lmtmd -DQUARRY_VISION
 endif
-CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c src/lfm2.c src/laguna.c
+# GPU=1: the hottest experts run on the GPU through ggml (llama.cpp built with -DGGML_VULKAN=ON,
+# -DGGML_CUDA=ON, ...). Without it gpu.c is a stub and everything runs on the CPU.
+ifeq ($(GPU),1)
+GPU_FLAGS = -DQUARRY_GPU -I$(LLAMA_DIR)/ggml/include
+endif
+CORE    = src/qgguf.c src/quants.c src/model.c src/experts.c src/inkling.c src/qwen35.c src/lfm2.c src/laguna.c src/gpu.c
 
 all: build/quarry build/quarry-bench build/quarry-info
 
@@ -21,7 +28,7 @@ src/chat_html.h: src/chat.html
 
 build/quarry: $(CORE) src/main.c src/*.h src/chat_html.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(CORE) src/main.c -o $@ $(LDLIBS) $(LLAMA_LIBS)
+	$(CC) $(CFLAGS) $(GPU_FLAGS) $(CORE) src/main.c -o $@ $(LDLIBS) $(LLAMA_LIBS)
 
 build/quarry-bench: $(CORE) tools/quarry_bench.c src/*.h
 	@mkdir -p build

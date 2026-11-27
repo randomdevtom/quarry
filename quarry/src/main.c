@@ -28,6 +28,7 @@
 #include "laguna.h"
 #include "model.h"
 #include "qwen35.h"
+#include "gpu.h"
 #include "chat_html.h"   // generated from src/chat.html by the Makefile
 #ifdef QUARRY_VISION
 #include "mtmd.h"
@@ -1018,6 +1019,7 @@ static int cmd_run(engine *e, const char *prompt, int n, float temp) {
                                 100.0 * e->qm.pred_correct / (e->qm.pred_total + 1e-9), q35_prof[0], q35_prof[1], q35_prof[2], q35_prof[3], q35_prof[4], q35_prof[5], q35_prof[6], q35_prof[7]);
             if (e->q35 && e->qm.sp_full) fprintf(stderr, " | sparse attn: %.1f%% of rows, summarize %.2fs score %.2fs pick %.2fs",
                                 100.0 * e->qm.sp_rows / e->qm.sp_full, q35_sp[0], q35_sp[1], q35_sp[2]);
+            if (e->q35 && e->qm.gpu) { char gb[256]; gpu_stats(e->qm.gpu, gb, sizeof gb); fprintf(stderr, " | %s", gb); }
             { extern double lfm_total; if (e->lfm) fprintf(stderr, " | forward %.2fs, matvec regions %.2fs", lfm_total, lfm_prof[7]); }
             if (e->lfm) fprintf(stderr, " | prediction %.0f%% | conv %.1fs attn %.1fs (core %.1fs) dense %.1fs route %.1fs experts %.1fs output %.1fs",
                                 100.0 * e->lm.pred_correct / (e->lm.pred_total + 1e-9), lfm_prof[0], lfm_prof[1], lfm_prof[6], lfm_prof[2], lfm_prof[3], lfm_prof[4], lfm_prof[5]);

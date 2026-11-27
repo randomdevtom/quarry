@@ -1,6 +1,7 @@
 // Qwen3.5 / Qwen3.6 MoE forward pass, one token at a time (see qwen35.h).
 #define _GNU_SOURCE
 #include "qwen35.h"
+#include "gpu.h"
 
 #include <immintrin.h>
 #include <math.h>
@@ -347,6 +348,16 @@ int q35_load(q35_model *m, const char *path, int n_ctx) {
     if (getenv("QUARRY_PACKED") && access(packed, R_OK) == 0) src.packed = packed;
     m->experts = experts_open_src(&src);
     free(off); free(bytes);
+    {   // GPU tier for the hottest experts (QUARRY_GPU=0 turns it off, QUARRY_GPU_GB sets its size)
+        int *ty = malloc(nl * 3 * sizeof(int));
+        for (int l = 0; l < nl; l++) {
+            ty[l * 3 + 0] = m->layers[l].gate_exps.type;
+            ty[l * 3 + 1] = m->layers[l].up_exps.type;
+            ty[l * 3 + 2] = m->layers[l].down_exps.type;
+        }
+        m->gpu = gpu_open(nl, c->n_expert, c->n_used, c->n_embd, c->n_ff, ty, getenv("QUARRY_GPU_GB") ? atof(getenv("QUARRY_GPU_GB")) : 0);
+        free(ty);
+    }
     m->prefetch_on = getenv("QUARRY_NO_PREFETCH") ? 0 : 1;
     return 0;
 }
@@ -1102,7 +1113,20 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
             for (int q = 0; q < (m->pred_n ? m->pred_n : K); q++) m->pred_correct += m->pred[l * 16 + q] == sel[j];
         m->pred_total += K;
     }
-    experts_begin_layer(m->experts, l, sel, K);
+    // experts in VRAM run on the GPU (started below, finished at the end); the CPU does the rest
+    int gslot[16], ng = 0;
+    float gwt[16];
+    if (m->gpu) {
+        int nk = 0;
+        for (int k = 0; k < K; k++) {
+            const int s = gpu_slot(m->gpu, l, sel[k]);
+            if (s >= 0) { gslot[ng] = s; gwt[ng++] = w[k]; }
+            else { sel[nk] = sel[k]; w[nk++] = w[k]; }
+        }
+        if (ng) gpu_moe_start(m->gpu, l, 1, &xn, ng, gslot, gwt);
+    }
+    const int KC = K - ng;   // experts left for the CPU, in sel/w
+    experts_begin_layer(m->experts, l, sel, KC);
     if (m->prefetch_on && xn_next && l + 1 < c->n_layer) {   // guess the next layer's experts
         // QUARRY_PF_EXTRA: also prefetch the next few most likely ones (more SSD reads, fewer misses)
         static int extra = -1;
@@ -1115,7 +1139,11 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
         if (pmin < 0) pmin = getenv("QUARRY_PF_MIN") ? atof(getenv("QUARRY_PF_MIN")) : 0;
         int np = kp;
         if (pmin > 0) { np = 0; for (int j = 0; j < kp; j++) if (pw[j] >= pmin) np++; }   // sorted by weight
-        experts_prefetch(m->experts, l + 1, m->pred + (l + 1) * 16, np);
+        if (m->gpu) {   // nothing to load for experts in VRAM
+            int pf[16], n2 = 0;
+            for (int j = 0; j < np; j++) if (gpu_slot(m->gpu, l + 1, m->pred[(l + 1) * 16 + j]) < 0) pf[n2++] = m->pred[(l + 1) * 16 + j];
+            experts_prefetch(m->experts, l + 1, pf, n2);
+        } else experts_prefetch(m->experts, l + 1, m->pred + (l + 1) * 16, np);
         m->pred_n = kp;
     }
     q35_prof[2] += qnow() - t0;
@@ -1146,12 +1174,12 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
     const int gt = L->gate_exps.type, ut = L->up_exps.type, dt = L->down_exps.type;
     const uint64_t grb = L->gate_exps.row_bytes, urb = L->up_exps.row_bytes, drb = L->down_exps.row_bytes;
     int done[16] = {0};
-    for (int n_done = 0; n_done < K;) {
+    for (int n_done = 0; n_done < KC;) {
         int bl[16], nb = 0;
-        for (int k = 0; k < K; k++) if (!done[k] && experts_ready(m->experts, l, sel[k])) bl[nb++] = k;
+        for (int k = 0; k < KC; k++) if (!done[k] && experts_ready(m->experts, l, sel[k])) bl[nb++] = k;
         if (!nb) {
             int rest[16], nr = 0;
-            for (int k = 0; k < K; k++) if (!done[k]) rest[nr++] = sel[k];
+            for (int k = 0; k < KC; k++) if (!done[k]) rest[nr++] = sel[k];
             experts_wait_any(m->experts, l, rest, nr);
             continue;
         }
@@ -1180,10 +1208,19 @@ static void moe(q35_model *m, int l, const float *xn, const float *xn_next, floa
             O[r] = row_dot(dt, dw[j] + (uint64_t)rr * drb, F, &hq[j]);
         }
         for (int j = 0; j < nb; j++) {
-            experts_release(m->experts, l, sel[bl[j]]);
+            if (!m->gpu) experts_release(m->experts, l, sel[bl[j]]);   // with a GPU: after offering it below
             const float wj = w[bl[j]];
             for (int i = 0; i < D; i++) out[i] += wj * O[j * D + i];
             done[bl[j]] = 1;
+        }
+    }
+    if (m->gpu) {
+        if (ng) gpu_moe_finish(m->gpu, &out);
+        for (int k = 0; k < KC; k++) {   // hot ones get copied into VRAM
+            const uint8_t *a, *b, *d;
+            experts_get(m->experts, l, sel[k], &a, &b, &d);
+            gpu_offer(m->gpu, l, sel[k], a, b, d);
+            experts_release(m->experts, l, sel[k]);
         }
     }
     q35_prof[3] += qnow() - t0;
@@ -1450,7 +1487,7 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
     const q35_cfg *c = &m->c;
     const q35_layer *L = &m->layers[l];
     const int K = c->n_used, F = c->n_ff, D = c->n_embd;
-    int sel[2][16], U[32], nu = 0;
+    int sel[2][16], U[32], nu = 0, gpu_on = 0;
     float w[2][16], uw[32][2];
     double t0 = qnow();
     route2(L, xn0, xn1, c, K, sel[0], w[0], sel[1], w[1]);
@@ -1466,6 +1503,32 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
             for (int q = 0; q < (m->pred_n ? m->pred_n : K); q++) m->pred_correct += m->pred[l * 16 + q] == sel[0][j];
         m->pred_total += K;
     }
+    // experts in VRAM: one GPU call for both tokens (each token's list padded to the same length
+    // with weight 0); U keeps only the CPU's experts
+    if (m->gpu) {
+        int gs[2][16], gn[2] = {0, 0}, nk = 0;
+        float gw2[2][16];
+        for (int u = 0; u < nu; u++) {
+            const int s = gpu_slot(m->gpu, l, U[u]);
+            if (s < 0) { U[nk] = U[u]; uw[nk][0] = uw[u][0]; uw[nk][1] = uw[u][1]; nk++; continue; }
+            for (int t = 0; t < 2; t++) if (uw[u][t] > 0) { gs[t][gn[t]] = s; gw2[t][gn[t]++] = uw[u][t]; }
+        }
+        nu = nk;
+        const int n = gn[0] > gn[1] ? gn[0] : gn[1];
+        if (n) {
+            int slot[32];
+            float wt[32];
+            const int pad = gn[0] ? gs[0][0] : gs[1][0];
+            for (int t = 0; t < 2; t++)
+                for (int j = 0; j < n; j++) {
+                    slot[t * n + j] = j < gn[t] ? gs[t][j] : pad;
+                    wt[t * n + j] = j < gn[t] ? gw2[t][j] : 0;
+                }
+            const float *X[2] = {xn0, xn1};
+            gpu_moe_start(m->gpu, l, 2, X, n, slot, wt);
+            gpu_on = 1;
+        }
+    }
     experts_begin_layer(m->experts, l, U, nu);
     if (m->prefetch_on && l + 1 < c->n_layer) {   // next layer: union of both tokens' guesses
         int p[2][16], pu[16], npu = 0;
@@ -1480,7 +1543,9 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
             }
         memcpy(m->pred + (l + 1) * 16, pu, sizeof pu);
         m->pred_n = npu;
-        experts_prefetch(m->experts, l + 1, pu, npu);
+        int pf[16], n2 = 0;
+        for (int j = 0; j < npu; j++) if (gpu_slot(m->gpu, l + 1, pu[j]) < 0) pf[n2++] = pu[j];
+        experts_prefetch(m->experts, l + 1, pf, n2);
     }
     q35_prof[2] += qnow() - t0;
 
@@ -1565,7 +1630,16 @@ static void moe2(q35_model *m, int l, const float *xn0, const float *xn1, float 
             float *o = outs[pt[j]];
             for (int i = 0; i < D; i++) o[i] += wj * O[j * D + i];
         }
-        for (int j = 0; j < nb; j++) { experts_release(m->experts, l, U[bl[j]]); done[bl[j]] = 1; }
+        for (int j = 0; j < nb; j++) { if (!m->gpu) experts_release(m->experts, l, U[bl[j]]); done[bl[j]] = 1; }
+    }
+    if (m->gpu) {
+        if (gpu_on) gpu_moe_finish(m->gpu, outs);
+        for (int k = 0; k < nu; k++) {
+            const uint8_t *a, *b, *d;
+            experts_get(m->experts, l, U[k], &a, &b, &d);
+            gpu_offer(m->gpu, l, U[k], a, b, d);
+            experts_release(m->experts, l, U[k]);
+        }
     }
     q35_prof[3] += qnow() - t0;
 }

@@ -54,6 +54,7 @@ typedef struct q35_model {
     float *output_norm;
     q35_layer *layers;
     struct expert_store *experts;
+    struct qgpu *gpu;               // VRAM tier for the hottest experts (gpu.h), or NULL
     // state: KV for attention layers (fp16), recurrent + conv state for delta-net layers
     int *attn_idx, *rec_idx, n_attn, n_rec;
     uint16_t *kc, *vc;              // [n_attn][n_ctx][n_head_kv * hd]
